@@ -1,0 +1,15 @@
+<?xml version="1.0"?>
+<Actions>
+    <!-- IWS HTTP endpoint for the Cloudflare Worker to forward inbound email.
+         Hidden from the Indigo UI. Called as POST /message/com.simons-plugins.home-intelligence/feedback -->
+    <Action id="feedback" uiPath="hidden">
+        <Name>Feedback Webhook (from Worker)</Name>
+        <CallbackMethod>handle_feedback</CallbackMethod>
+    </Action>
+
+    <!-- Health check for the Worker to verify the plugin is reachable. -->
+    <Action id="status" uiPath="hidden">
+        <Name>Plugin Status (HTTP)</Name>
+        <CallbackMethod>handle_status</CallbackMethod>
+    </Action>
+</Actions>

@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<MenuItems>
+    <MenuItem id="runDigestNow">
+        <Name>Run Digest Now</Name>
+        <CallbackMethod>menuRunDigestNow</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="showAgentRules">
+        <Name>Show Agent Rules</Name>
+        <CallbackMethod>menuShowAgentRules</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="disableAllRules">
+        <Name>Disable All Agent Rules</Name>
+        <CallbackMethod>menuDisableAllRules</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="showStatus">
+        <Name>Show Status</Name>
+        <CallbackMethod>menuShowStatus</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="toggleDebug">
+        <Name>Toggle Debug Logging</Name>
+        <CallbackMethod>menuToggleDebug</CallbackMethod>
+    </MenuItem>
+</MenuItems>

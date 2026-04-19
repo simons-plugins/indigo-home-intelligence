@@ -1,0 +1,142 @@
+<?xml version="1.0"?>
+<PluginConfig>
+    <Field id="introLabel" type="label" fontSize="small" fontColor="darkgray">
+        <Label>Home Intelligence reads your Indigo history, writes a weekly digest, and enforces rules you approve by email reply.</Label>
+    </Field>
+
+    <Field id="separator0" type="separator" />
+
+    <Field id="showDebugInfo" type="checkbox" defaultValue="false">
+        <Label>Enable debug logging:</Label>
+        <Description>Verbose log output in Indigo Event Log</Description>
+    </Field>
+
+    <Field id="separator1" type="separator" />
+
+    <Field id="historyLabel" type="label">
+        <Label>Indigo SQL Logger Database</Label>
+    </Field>
+
+    <Field id="dbType" type="menu" defaultValue="sqlite">
+        <Label>Database type:</Label>
+        <List>
+            <Option value="sqlite">SQLite</Option>
+            <Option value="postgresql">PostgreSQL</Option>
+        </List>
+    </Field>
+
+    <Field id="sqlitePath" type="textfield" defaultValue=""
+           visibleBindingId="dbType" visibleBindingValue="sqlite">
+        <Label>SQLite path (blank = auto-detect):</Label>
+    </Field>
+
+    <Field id="pgHost" type="textfield" defaultValue="127.0.0.1"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Host:</Label>
+    </Field>
+    <Field id="pgPort" type="textfield" defaultValue="5432"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Port:</Label>
+    </Field>
+    <Field id="pgUser" type="textfield" defaultValue="postgres"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Username:</Label>
+    </Field>
+    <Field id="pgPassword" type="textfield" defaultValue="" secure="true"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Password:</Label>
+    </Field>
+    <Field id="pgDatabase" type="textfield" defaultValue="indigo_history"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Database name:</Label>
+    </Field>
+
+    <Field id="separator2" type="separator" />
+
+    <Field id="anthropicLabel" type="label">
+        <Label>Anthropic API</Label>
+    </Field>
+
+    <Field id="anthropicApiKey" type="textfield" defaultValue="" secure="true">
+        <Label>API key:</Label>
+        <Description>Used for weekly digest generation. Get one at console.anthropic.com.</Description>
+    </Field>
+
+    <Field id="anthropicModel" type="menu" defaultValue="claude-sonnet-4-6">
+        <Label>Model:</Label>
+        <List>
+            <Option value="claude-sonnet-4-6">Sonnet 4.6 (recommended)</Option>
+            <Option value="claude-opus-4-7">Opus 4.7 (slower, more detailed)</Option>
+            <Option value="claude-haiku-4-5-20251001">Haiku 4.5 (fastest, cheapest)</Option>
+        </List>
+    </Field>
+
+    <Field id="monthlySpendCapGbp" type="textfield" defaultValue="5.00">
+        <Label>Monthly spend cap (GBP):</Label>
+        <Description>Soft cap. Warns at 80%, stops digest generation at 100%.</Description>
+    </Field>
+
+    <Field id="separator3" type="separator" />
+
+    <Field id="digestLabel" type="label">
+        <Label>Weekly Digest</Label>
+    </Field>
+
+    <Field id="digestDay" type="menu" defaultValue="sunday">
+        <Label>Day:</Label>
+        <List>
+            <Option value="monday">Monday</Option>
+            <Option value="tuesday">Tuesday</Option>
+            <Option value="wednesday">Wednesday</Option>
+            <Option value="thursday">Thursday</Option>
+            <Option value="friday">Friday</Option>
+            <Option value="saturday">Saturday</Option>
+            <Option value="sunday">Sunday</Option>
+        </List>
+    </Field>
+
+    <Field id="digestTime" type="textfield" defaultValue="18:00">
+        <Label>Local time (HH:MM):</Label>
+    </Field>
+
+    <Field id="digestEmailTo" type="textfield" defaultValue="">
+        <Label>Send to email:</Label>
+    </Field>
+
+    <Field id="separator4" type="separator" />
+
+    <Field id="deliveryLabel" type="label">
+        <Label>Delivery (Cloudflare Worker)</Label>
+    </Field>
+
+    <Field id="deliveryWorkerUrl" type="textfield" defaultValue="https://push.domio-smart-home.app">
+        <Label>Worker URL:</Label>
+        <Description>Shares the existing domio-push-relay. Uses /email-out and /email-in routes.</Description>
+    </Field>
+
+    <Field id="deliveryHmacSecret" type="textfield" defaultValue="" secure="true">
+        <Label>HMAC shared secret:</Label>
+        <Description>Must match the relay's HOME_INTELLIGENCE_HMAC_SECRET env var.</Description>
+    </Field>
+
+    <Field id="separator5" type="separator" />
+
+    <Field id="rulesLabel" type="label">
+        <Label>Agent Rules</Label>
+    </Field>
+
+    <Field id="ruleStoreVariable" type="textfield" defaultValue="home_intelligence_rules">
+        <Label>Rule store variable:</Label>
+        <Description>Indigo variable holding JSON-serialised rules the agent has written. Created automatically on first run.</Description>
+    </Field>
+
+    <Field id="ruleEvaluatorIntervalSec" type="textfield" defaultValue="60">
+        <Label>Evaluator interval (seconds):</Label>
+        <Description>How often to check live device state against agent rules.</Description>
+    </Field>
+
+    <Field id="rulesEnabled" type="checkbox" defaultValue="true">
+        <Label>Enable rule evaluator:</Label>
+        <Description>Master switch. Disables all agent-written rules without deleting them.</Description>
+    </Field>
+</PluginConfig>
