@@ -4,22 +4,29 @@ Inbox poller - IMAP loop that ingests digest replies.
 Per ADR-0002, the Home Intelligence feedback loop polls the user's IMAP
 folder every N minutes, parses YES/NO/SNOOZE replies, matches them to
 observations by In-Reply-To / References (with an X-HI-Reply-Id header
-and a [obs-<id>] subject tag as fallbacks), and POSTs a signed payload
-to the plugin's own /feedback endpoint over localhost.
+and a [obs-<id>] subject tag as fallbacks), and calls a feedback
+dispatcher callback in the plugin process.
+
+Previously posted over HTTP to the plugin's /feedback IWS endpoint —
+swapped for a direct callback because inbox and handler live in the
+same Python process, so the round trip through Indigo's web server
+was pure overhead (and hit an auth/connection wall on localhost).
 
 email-reply-parser is used when available to strip quoted content from
 threaded replies; falls back to a simple marker-based stripper if the
 package isn't installed.
+
+IMAP FETCH uses BODY.PEEK[] rather than RFC822 — a raw RFC822 fetch
+implicitly sets the \\Seen flag on the server, which we don't want
+until we've actually processed the reply successfully.
 """
 
 import email
 import imaplib
-import json
 import re
 import ssl
-import urllib.request
 from email.header import decode_header, make_header
-from typing import Optional
+from typing import Callable, Optional
 
 try:
     from email_reply_parser import EmailReplyParser
@@ -58,8 +65,7 @@ class InboxPoller:
         imap_user: str,
         imap_password: str,
         imap_folder: str,
-        feedback_url: str,
-        delivery_client,
+        feedback_callback: Callable[[dict], dict],
         logger,
         imap_use_ssl: bool = True,
         timeout_sec: int = 30,
@@ -69,15 +75,17 @@ class InboxPoller:
         self.imap_user = imap_user
         self.imap_password = imap_password
         self.imap_folder = imap_folder or "INBOX"
-        self.feedback_url = feedback_url
-        self.delivery = delivery_client
+        self.feedback_callback = feedback_callback
         self.logger = logger
         self.imap_use_ssl = imap_use_ssl
         self.timeout_sec = timeout_sec
 
     def configured(self) -> bool:
         return bool(
-            self.imap_host and self.imap_user and self.imap_password and self.feedback_url
+            self.imap_host
+            and self.imap_user
+            and self.imap_password
+            and self.feedback_callback is not None
         )
 
     # ------------------------------------------------------------------
@@ -105,11 +113,22 @@ class InboxPoller:
             if typ != "OK":
                 self.logger.warning(f"IMAP: cannot select folder '{self.imap_folder}'")
                 return 0
-            # Narrow to digest replies via the [obs-...] subject tag.
-            # imaplib joins string args with spaces; the two double-quoted
-            # tokens keep the bracket literal through the server.
-            self.logger.debug("IMAP: searching UNSEEN SUBJECT [obs-")
-            typ, data = conn.search(None, "UNSEEN", "SUBJECT", '"[obs-"')
+            # Target replies to our digest by the In-Reply-To header. The
+            # digest Message-ID is stamped as "<hi-<replyid>-...@domain>"
+            # so any reply in the same thread carries it in In-Reply-To.
+            # (Subject search was tried first but Gmail tokenises SUBJECT
+            # at indexing time and won't substring-match "[obs-".)
+            self.logger.debug("IMAP: searching UNSEEN HEADER In-Reply-To hi-")
+            typ, data = conn.search(
+                None, "UNSEEN", "HEADER", "In-Reply-To", '"hi-"'
+            )
+            if typ != "OK" or not data or not data[0]:
+                # Fallback: subject tag match for non-Gmail servers or
+                # clients that strip threading headers.
+                self.logger.debug(
+                    'IMAP: no In-Reply-To match; trying SUBJECT "[obs-"'
+                )
+                typ, data = conn.search(None, "UNSEEN", "SUBJECT", '"[obs-"')
             if typ != "OK" or not data or not data[0]:
                 self.logger.debug("IMAP: no matching unseen messages")
                 return 0
@@ -165,7 +184,10 @@ class InboxPoller:
         return conn
 
     def _process_message(self, conn, uid: bytes) -> bool:
-        typ, msg_data = conn.fetch(uid, "(RFC822)")
+        # BODY.PEEK[] fetches the full RFC822 content WITHOUT setting
+        # the \Seen flag — critical because we only want to mark the
+        # message seen after successful processing.
+        typ, msg_data = conn.fetch(uid, "(BODY.PEEK[])")
         if typ != "OK" or not msg_data or not msg_data[0]:
             return False
         raw = msg_data[0][1]
@@ -195,10 +217,22 @@ class InboxPoller:
             "subject": subject,
             "from": from_addr,
         }
-        ok = self._post_feedback(payload)
-        if ok:
+
+        try:
+            result = self.feedback_callback(payload) or {}
+        except Exception as exc:
+            self.logger.exception(f"Feedback callback raised: {exc}")
+            return False
+
+        status = str(result.get("status", "")).lower()
+        if status in ("ok", "accepted"):
             conn.store(uid, "+FLAGS", "\\Seen")
-        return ok
+            return True
+        self.logger.warning(
+            f"Feedback dispatcher returned status={status!r} for obs={reply_id}; "
+            "leaving message UNSEEN for retry"
+        )
+        return False
 
     # ------------------------------------------------------------------
     # Parsing helpers
@@ -261,30 +295,6 @@ class InboxPoller:
             if pat.match(first_line):
                 return intent
         return "query"
-
-    # ------------------------------------------------------------------
-    # /feedback POST
-    # ------------------------------------------------------------------
-
-    def _post_feedback(self, payload: dict) -> bool:
-        signature = self.delivery.sign(payload)
-        raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        req = urllib.request.Request(
-            self.feedback_url,
-            data=raw,
-            headers={
-                "Content-Type": "application/json",
-                "X-HI-Signature": signature,
-            },
-            method="POST",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                return 200 <= resp.status < 300
-        except Exception as exc:
-            self.logger.exception(f"Feedback POST failed: {exc}")
-            return False
-
 
 def _decode_part(part) -> str:
     payload = part.get_payload(decode=True)

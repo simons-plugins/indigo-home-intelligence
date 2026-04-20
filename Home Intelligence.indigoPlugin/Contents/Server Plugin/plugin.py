@@ -31,10 +31,6 @@ DAYS_OF_WEEK = {
     "friday": 4, "saturday": 5, "sunday": 6,
 }
 
-DEFAULT_FEEDBACK_URL = (
-    "http://127.0.0.1:8176/message/com.simons-plugins.home-intelligence/feedback"
-)
-
 
 class Plugin(indigo.PluginBase):
     def __init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs):
@@ -104,8 +100,7 @@ class Plugin(indigo.PluginBase):
             imap_user=self.pluginPrefs.get("imapUser", ""),
             imap_password=self.pluginPrefs.get("imapPassword", ""),
             imap_folder=self.pluginPrefs.get("imapFolder", "INBOX"),
-            feedback_url=self.pluginPrefs.get("feedbackUrl", DEFAULT_FEEDBACK_URL),
-            delivery_client=self.delivery,
+            feedback_callback=self._dispatch_feedback,
             imap_use_ssl=bool(self.pluginPrefs.get("imapUseSsl", True)),
             logger=self.logger,
         )
@@ -271,8 +266,10 @@ class Plugin(indigo.PluginBase):
         return {"status": "ok", "plugin": "home-intelligence"}
 
     def handle_feedback(self, action, dev=None, callerWaitingForResult=None):
-        """Receive signed feedback (from inbox.py, or any other channel posting
-        to this endpoint with a matching HMAC signature)."""
+        """IWS HTTP entrypoint. Parses the request, verifies HMAC, and
+        delegates to _dispatch_feedback. Retained for external callers
+        (e.g. future iMessage plugin); the inbox poller bypasses this
+        and calls _dispatch_feedback directly in-process."""
         try:
             body_props = action.props.get("body_params", indigo.Dict()) or indigo.Dict()
             raw_body = action.props.get("request_body", b"")
@@ -284,75 +281,79 @@ class Plugin(indigo.PluginBase):
                 action.props.get("headers", indigo.Dict()).get("X-HI-Signature")
                 or payload.pop("signature", None)
             )
-
             if not self.delivery.verify_signature(payload, signature):
                 self.logger.warning("Feedback webhook: invalid signature")
                 return {"status": "unauthorized"}
 
-            observation_id = payload.get("observation_id")
-            intent = payload.get("intent")  # "yes" | "no" | "query" | "snooze"
-            body_text = payload.get("body", "")
-
-            self.logger.info(
-                f"Feedback received: obs={observation_id} intent={intent} body_len={len(body_text)}"
-            )
-
-            observation = (
-                self.observation_store.get(observation_id)
-                if observation_id
-                else None
-            )
-            if observation_id and not observation:
-                self.logger.warning(
-                    f"Feedback references unknown observation {observation_id}"
-                )
-
-            if intent == "yes":
-                proposed_rule = (observation or {}).get("proposed_rule")
-                if not proposed_rule:
-                    self.logger.info(
-                        f"YES reply for {observation_id} but no proposed_rule "
-                        "attached to the observation; recording response only"
-                    )
-                    self.observation_store.record_response(
-                        observation_id, "yes", body=body_text
-                    )
-                    return {"status": "ok", "rule_id": None}
-                rule_id = self.rule_store.add_rule(proposed_rule)
-                self.observation_store.record_response(
-                    observation_id, "yes", body=body_text, rule_id=rule_id
-                )
-                self.logger.info(
-                    f"Created agent rule {rule_id} from YES on observation {observation_id}"
-                )
-                return {"status": "ok", "rule_id": rule_id}
-
-            if intent == "no":
-                self.observation_store.record_response(
-                    observation_id, "no", body=body_text
-                )
-                self.logger.info(f"User declined observation {observation_id}")
-                return {"status": "ok"}
-
-            if intent == "snooze":
-                self.observation_store.record_response(
-                    observation_id, "snooze", body=body_text
-                )
-                return {"status": "ok"}
-
-            # Free-text query: defer to a future digest-or-ask-Claude path.
-            if observation_id:
-                self.observation_store.record_response(
-                    observation_id, "ignored", body=body_text
-                )
-            self.logger.info(
-                "Free-text query received (not yet implemented): "
-                f"{body_text[:120]!r}"
-            )
-            return {"status": "accepted", "note": "query path not yet wired"}
+            return self._dispatch_feedback(payload)
         except Exception as exc:
             self.logger.exception(f"handle_feedback failed: {exc}")
             return {"status": "error", "detail": traceback.format_exc(limit=2)}
+
+    def _dispatch_feedback(self, payload: dict) -> dict:
+        """Process a decoded feedback payload. Called directly by the inbox
+        poller (same process, no HMAC needed) and via handle_feedback for
+        HTTP callers. Always returns a dict with a 'status' key."""
+        observation_id = payload.get("observation_id")
+        intent = payload.get("intent")  # "yes" | "no" | "query" | "snooze"
+        body_text = payload.get("body", "")
+
+        self.logger.info(
+            f"Feedback received: obs={observation_id} intent={intent} "
+            f"body_len={len(body_text)}"
+        )
+
+        observation = (
+            self.observation_store.get(observation_id) if observation_id else None
+        )
+        if observation_id and not observation:
+            self.logger.warning(
+                f"Feedback references unknown observation {observation_id}"
+            )
+
+        if intent == "yes":
+            proposed_rule = (observation or {}).get("proposed_rule")
+            if not proposed_rule:
+                self.logger.info(
+                    f"YES reply for {observation_id} but no proposed_rule "
+                    "attached to the observation; recording response only"
+                )
+                self.observation_store.record_response(
+                    observation_id, "yes", body=body_text
+                )
+                return {"status": "ok", "rule_id": None}
+            rule_id = self.rule_store.add_rule(proposed_rule)
+            self.observation_store.record_response(
+                observation_id, "yes", body=body_text, rule_id=rule_id
+            )
+            self.logger.info(
+                f"Created agent rule {rule_id} from YES on observation {observation_id}"
+            )
+            return {"status": "ok", "rule_id": rule_id}
+
+        if intent == "no":
+            self.observation_store.record_response(
+                observation_id, "no", body=body_text
+            )
+            self.logger.info(f"User declined observation {observation_id}")
+            return {"status": "ok"}
+
+        if intent == "snooze":
+            self.observation_store.record_response(
+                observation_id, "snooze", body=body_text
+            )
+            return {"status": "ok"}
+
+        # Free-text query: defer to a future digest-or-ask-Claude path.
+        if observation_id:
+            self.observation_store.record_response(
+                observation_id, "ignored", body=body_text
+            )
+        self.logger.info(
+            "Free-text query received (not yet implemented): "
+            f"{body_text[:120]!r}"
+        )
+        return {"status": "accepted", "note": "query path not yet wired"}
 
     # ------------------------------------------------------------------
     # Helpers
