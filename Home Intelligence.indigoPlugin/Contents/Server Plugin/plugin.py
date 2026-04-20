@@ -1,13 +1,17 @@
 """
 Home Intelligence - Indigo plugin.
 
-Produces a weekly digest from SQL Logger history via a Claude model, sends
-it out over the user's SMTP server, polls their IMAP inbox for YES/NO
-replies, and enforces agent-proposed rules the user has approved
-(Pattern 1: plugin-internal rule engine, Auto Lights style - because
-indigo.trigger.create() does not exist).
+Produces a weekly digest from SQL Logger history via a Claude model,
+sends it over the user's SMTP server, polls their IMAP inbox for
+YES/NO replies, and enforces agent-proposed rules the user has
+approved (Auto Lights-style plugin-internal rule engine because
+indigo.trigger.create() is not in the Indigo Object Model).
 
-See ADR-0002 for the email-in/out decision.
+Architectural decisions:
+  - Workspace ADR-0002 (~/vsCodeProjects/Indigo/docs/adr/0002-*)
+    for the SMTP/IMAP email-in/out choice.
+  - Repo-local docs/adr/0001-plugin-internal-rule-engine.md for the
+    rule-engine-vs-native-triggers choice.
 """
 
 import json
@@ -23,7 +27,7 @@ from rule_evaluator import RuleEvaluator
 from observation_store import ObservationStore
 from digest import DigestRunner
 from delivery import DeliveryClient
-from inbox import InboxPoller
+from inbox import InboxPoller, InboxPollError
 
 
 DAYS_OF_WEEK = {
@@ -173,8 +177,13 @@ class Plugin(indigo.PluginBase):
         self._last_inbox_poll_at = now
         try:
             self.inbox.poll()
+        except InboxPollError as exc:
+            # Infrastructure error (connect/login/select). One log line,
+            # no traceback — the message is self-explanatory and keeps
+            # the log readable across many repeated polls.
+            self.logger.error(f"Inbox poll failed: {exc}")
         except Exception as exc:
-            self.logger.exception(f"Inbox poll failed: {exc}")
+            self.logger.exception(f"Inbox poll failed unexpectedly: {exc}")
 
     def _tick_digest_clock(self):
         target_day = DAYS_OF_WEEK.get(
@@ -188,20 +197,36 @@ class Plugin(indigo.PluginBase):
             hh, mm = 18, 0
 
         now_local = datetime.now().astimezone()
-        if (
-            now_local.weekday() == target_day
-            and now_local.hour == hh
-            and now_local.minute == mm
-            and self._last_digest_date != now_local.date()
-        ):
-            self._last_digest_date = now_local.date()
+        if now_local.weekday() != target_day:
+            return
+        if self._last_digest_date == now_local.date():
+            return
+
+        # Fire at target_time OR any later time on the target day: the plugin
+        # may have missed the exact minute (restart mid-minute, long
+        # runConcurrentThread tick, laptop asleep). We still run, and we log
+        # a warning if the catch-up is more than a few minutes late so the
+        # operator can see it.
+        target_today = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if now_local < target_today:
+            return
+
+        late_by = (now_local - target_today).total_seconds()
+        self._last_digest_date = now_local.date()
+        if late_by > 300:
+            self.logger.warning(
+                f"Firing weekly digest for {now_local.date().isoformat()} "
+                f"late by {int(late_by)}s (scheduled {hh:02d}:{mm:02d}, "
+                f"ran {now_local.strftime('%H:%M')})"
+            )
+        else:
             self.logger.info(
                 f"Firing weekly digest for {now_local.date().isoformat()}"
             )
-            try:
-                self.digest.run(window_days=7)
-            except Exception as exc:
-                self.logger.exception(f"Digest run failed: {exc}")
+        try:
+            self.digest.run(window_days=7)
+        except Exception as exc:
+            self.logger.exception(f"Digest run failed: {exc}")
 
     # ------------------------------------------------------------------
     # Menu callbacks
@@ -265,9 +290,13 @@ class Plugin(indigo.PluginBase):
             return
         try:
             count = self.inbox.poll()
-            self.logger.info(f"Poll complete: {count} reply/replies processed")
+        except InboxPollError as exc:
+            self.logger.error(f"Poll failed: {exc}")
+            return
         except Exception as exc:
-            self.logger.exception(f"Manual inbox poll failed: {exc}")
+            self.logger.exception(f"Manual inbox poll failed unexpectedly: {exc}")
+            return
+        self.logger.info(f"Poll complete: {count} reply/replies processed")
 
     def menuToggleDebug(self):
         self.debug = not self.debug
@@ -283,10 +312,15 @@ class Plugin(indigo.PluginBase):
         return {"status": "ok", "plugin": "home-intelligence"}
 
     def handle_feedback(self, action, dev=None, callerWaitingForResult=None):
-        """IWS HTTP entrypoint. Parses the request, verifies HMAC, and
-        delegates to _dispatch_feedback. Retained for external callers
-        (e.g. future iMessage plugin); the inbox poller bypasses this
-        and calls _dispatch_feedback directly in-process."""
+        """IWS HTTP entrypoint — parses the JSON body, verifies the
+        X-HI-Signature HMAC, and delegates to _dispatch_feedback.
+
+        Currently has no in-tree callers: the inbox poller calls
+        _dispatch_feedback directly in-process. Kept for future
+        out-of-process signal sources (iMessage plugin, shortcuts hook,
+        webhook). Deletion criterion: remove if no such caller arrives
+        after a reasonable interval, and simplify to keep only the
+        in-process path."""
         try:
             body_props = action.props.get("body_params", indigo.Dict()) or indigo.Dict()
             raw_body = action.props.get("request_body", b"")
@@ -452,9 +486,13 @@ class Plugin(indigo.PluginBase):
         self.observation_store.ensure_variable_exists()
 
     def _ensure_internal_hmac_secret(self) -> str:
-        """Generate the HMAC secret used to authenticate inbox→/feedback POSTs.
-        Not user-configurable — it's purely internal. Stored in pluginPrefs
-        on first startup so it survives restarts."""
+        """Generate and persist the HMAC secret used by handle_feedback to
+        authenticate external HTTP callers on the IWS /feedback endpoint.
+        Not user-configurable. Stored in pluginPrefs so it survives
+        restarts; rotating it requires clearing that pref. The in-process
+        inbox poller bypasses the IWS endpoint entirely, so this secret
+        is dead weight today but kept for future out-of-process channels
+        (iMessage plugin, webhook, shortcut)."""
         secret = self.pluginPrefs.get("internalHmacSecret", "")
         if secret:
             return secret

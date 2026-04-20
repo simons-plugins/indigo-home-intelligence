@@ -1,24 +1,36 @@
 """
 Inbox poller - IMAP loop that ingests digest replies.
 
-Per ADR-0002, the Home Intelligence feedback loop polls the user's IMAP
-folder every N minutes, parses YES/NO/SNOOZE replies, matches them to
-observations by In-Reply-To / References (with an X-HI-Reply-Id header
-and a [obs-<id>] subject tag as fallbacks), and calls a feedback
-dispatcher callback in the plugin process.
+Per workspace ADR-0002 (~/vsCodeProjects/Indigo/docs/adr/0002-*), the
+feedback loop polls the user's IMAP folder every N minutes, parses
+YES/NO/SNOOZE replies, matches them to observations by In-Reply-To /
+References (with an X-HI-Reply-Id header and a [obs-<id>] subject tag
+as fallbacks), and calls a feedback dispatcher callback in the plugin
+process. Inbox and handler run in the same Python process, so an HTTP
+hop through Indigo's web server would add auth and latency without
+any isolation benefit — the callback is direct.
 
-Previously posted over HTTP to the plugin's /feedback IWS endpoint —
-swapped for a direct callback because inbox and handler live in the
-same Python process, so the round trip through Indigo's web server
-was pure overhead (and hit an auth/connection wall on localhost).
+Gmail tokenises SUBJECT at indexing time and won't substring-match
+"[obs-", so the primary search is on the In-Reply-To header (which
+preserves the "<hi-<replyid>-...@domain>" Message-ID we stamp in
+delivery.py). SUBJECT is kept as a fallback for non-Gmail servers
+where substring match on the header index works per RFC 3501.
 
-email-reply-parser is used when available to strip quoted content from
-threaded replies; falls back to a simple marker-based stripper if the
-package isn't installed.
+email-reply-parser is used when available to strip quoted content
+from threaded replies; falls back to a simple marker-based stripper
+if the package isn't installed.
 
-IMAP FETCH uses BODY.PEEK[] rather than RFC822 — a raw RFC822 fetch
+IMAP FETCH uses BODY.PEEK[] rather than RFC822 - a raw RFC822 fetch
 implicitly sets the \\Seen flag on the server, which we don't want
-until we've actually processed the reply successfully.
+until we've actually processed the reply successfully. The \\Seen
+flag only flips after feedback_callback returns status in
+{ok, accepted}; any earlier failure leaves the message UNSEEN for
+the next poll.
+
+poll() raises on connect/login/folder-select failure so the caller
+can distinguish "IMAP unreachable" from "no messages to process".
+Previously both signalled zero processed, which made the "Poll Inbox
+Now" menu indistinguishable from a healthy empty inbox.
 """
 
 import email
@@ -34,6 +46,11 @@ try:
 except ImportError:
     EmailReplyParser = None
     _HAVE_EMAIL_REPLY_PARSER = False
+
+
+class InboxPollError(Exception):
+    """Raised by InboxPoller.poll on connect/login/folder-select failure.
+    Per-message processing failures are logged but not raised."""
 
 
 _INTENT_PATTERNS = [
@@ -93,7 +110,15 @@ class InboxPoller:
     # ------------------------------------------------------------------
 
     def poll(self) -> int:
-        """Process UNSEEN messages in the configured folder. Returns count processed."""
+        """Process UNSEEN digest replies in the configured folder.
+        Returns count processed.
+
+        Raises InboxPollError on connect/login/folder-select failure so
+        the caller can distinguish infrastructure problems from a
+        genuinely-empty inbox. Per-message processing errors are caught
+        and logged but do not raise — one bad message shouldn't poison
+        the rest of the batch.
+        """
         if not self.configured():
             return 0
         self.logger.debug(
@@ -103,16 +128,16 @@ class InboxPoller:
         try:
             conn = self._connect()
         except Exception as exc:
-            self.logger.exception(f"IMAP connect failed: {exc}")
-            return 0
+            raise InboxPollError(f"IMAP connect/login failed: {exc}") from exc
 
         count = 0
         try:
             self.logger.debug(f"IMAP: selecting folder '{self.imap_folder}'")
             typ, _ = conn.select(self.imap_folder)
             if typ != "OK":
-                self.logger.warning(f"IMAP: cannot select folder '{self.imap_folder}'")
-                return 0
+                raise InboxPollError(
+                    f"IMAP cannot select folder '{self.imap_folder}' (response={typ})"
+                )
             # Target replies to our digest by the In-Reply-To header. The
             # digest Message-ID is stamped as "<hi-<replyid>-...@domain>"
             # so any reply in the same thread carries it in In-Reply-To.
@@ -189,6 +214,9 @@ class InboxPoller:
         # message seen after successful processing.
         typ, msg_data = conn.fetch(uid, "(BODY.PEEK[])")
         if typ != "OK" or not msg_data or not msg_data[0]:
+            self.logger.warning(
+                f"IMAP FETCH returned typ={typ!r} for uid {uid!r}; skipping"
+            )
             return False
         raw = msg_data[0][1]
         msg = email.message_from_bytes(raw)

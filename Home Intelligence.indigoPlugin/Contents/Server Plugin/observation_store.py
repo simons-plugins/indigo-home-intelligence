@@ -157,6 +157,17 @@ class ObservationStore:
         self._write(existing)
         return observation
 
+    def delete(self, observation_id: str) -> bool:
+        """Remove an observation by id. Returns True if removed, False if
+        not found. Used to roll back persistence on permanent delivery
+        failure so dedup doesn't block re-proposing next week."""
+        observations = self._read()
+        kept = [o for o in observations if o.get("id") != observation_id]
+        if len(kept) == len(observations):
+            return False
+        self._write(kept)
+        return True
+
     def record_response(
         self,
         observation_id: str,

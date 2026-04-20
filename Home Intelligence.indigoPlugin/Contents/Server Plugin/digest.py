@@ -5,18 +5,27 @@ v1: reasons over the home's structure (device inventory, triggers,
 schedules, existing agent rules) + memory of prior observations, and
 asks Claude to surface ONE thing worth the user's attention with an
 optional proposed automation rule. No SQL Logger history rollup yet —
-that lands in a follow-up once the end-to-end loop is validated.
+that's tracked in issue #3 on the repo.
 
 Prompt layout (matters for caching):
-    system_blocks[0] = INSTRUCTIONS (always stable, no cache_control)
-    system_blocks[1] = HOUSE MODEL + rules + prior observations
-                      (changes over time; cache_control on this block
-                      so repeat runs within the TTL hit cache)
-    user_message    = Current date + digest task (volatile)
+    system_blocks[0] = INSTRUCTIONS  (small, stable — NOT tagged for
+                      cache because it's well under the 1024-token
+                      minimum-cacheable-prefix threshold)
+    system_blocks[1] = HOUSE MODEL + existing rules + recent
+                      observations, tagged with cache_control. This
+                      is the large block (~100k tokens for a
+                      thousand-device house); worth caching even
+                      though weekly cadence rarely benefits from the
+                      5-minute TTL. The real benefit is manual
+                      re-runs ("Run Digest Now" back-to-back) and
+                      future integrations that call digest/summarise
+                      paths repeatedly.
+    user_message    = Current date + digest task (volatile — always
+                      changes, explicitly outside the cache prefix).
 
-Output is structured JSON; we instruct Claude to return a single JSON
-object matching the schema documented in INSTRUCTIONS. If parsing
-fails, we log and skip rather than email a malformed digest.
+Output is JSON instructed-in-the-prompt. We validate shape via
+_validate_parsed after parsing and skip rather than email a
+malformed digest. See _validate_parsed for the allowed shape.
 """
 
 import json
@@ -378,28 +387,52 @@ class DigestRunner:
         observation = parsed.get("observation")
 
         reply_id: Optional[str] = None
+        stored_obs: Optional[dict] = None
         if isinstance(observation, dict) and observation.get("headline"):
             try:
-                stored = self.observation_store.add(
+                stored_obs = self.observation_store.add(
                     headline=observation.get("headline", ""),
                     rationale=observation.get("rationale", ""),
                     proposed_rule=observation.get("proposed_rule"),
                     related_devices=observation.get("related_devices", []) or [],
                 )
-                reply_id = stored["id"]
-                body_markdown = self._append_reply_footer(body_markdown, stored)
+                reply_id = stored_obs["id"]
+                body_markdown = self._append_reply_footer(body_markdown, stored_obs)
             except Exception as exc:
                 self.logger.exception(f"Failed to persist observation: {exc}")
 
-        sent_id = self.delivery.send_email(
+        # Classified send so we can distinguish permanent from transient
+        # SMTP failure. On a permanent failure we roll back the
+        # observation: next week's digest would otherwise dedup against
+        # an observation the user never saw.
+        msg_id, error = self.delivery.send_email_with_result(
             subject=subject,
             body_markdown=body_markdown,
             reply_id=reply_id,
         )
-        if sent_id is None:
-            self.logger.warning("Digest email send reported failure")
-            return None
-        return reply_id or "(sent, no observation)"
+        if msg_id is not None:
+            return reply_id or "(sent, no observation)"
+
+        if error == "permanent" and stored_obs is not None:
+            if self.observation_store.delete(stored_obs["id"]):
+                self.logger.warning(
+                    f"Rolled back observation {stored_obs['id']} after permanent "
+                    "SMTP failure so next digest can re-propose if the pattern "
+                    "holds"
+                )
+            else:
+                self.logger.warning(
+                    f"Permanent SMTP failure but could not delete observation "
+                    f"{stored_obs['id']}; dedup may block re-suggestion"
+                )
+        elif error == "transient" and stored_obs is not None:
+            self.logger.warning(
+                f"Transient SMTP failure; observation {stored_obs['id']} "
+                "retained (weekly dedup will skip re-proposing it). User won't "
+                "see this week's digest unless we retry."
+            )
+        self.logger.warning(f"Digest email not delivered: error={error}")
+        return None
 
     @staticmethod
     def _append_reply_footer(body: str, observation: dict) -> str:
