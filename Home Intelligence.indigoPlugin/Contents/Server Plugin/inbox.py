@@ -39,6 +39,10 @@ _INTENT_PATTERNS = [
 _REPLY_ID_IN_MESSAGE_ID = re.compile(r"<hi-([A-Za-z0-9_-]+)-")
 _REPLY_ID_IN_SUBJECT = re.compile(r"\[obs-([A-Za-z0-9_-]+)\]")
 
+# Hard cap per poll. Narrowed search normally returns <10 results, but a
+# misconfigured folder or a buggy server could swamp us otherwise.
+MAX_MESSAGES_PER_POLL = 100
+
 _QUOTED_START_PATTERNS = (
     re.compile(r"^\s*On .+ wrote:\s*$"),
     re.compile(r"^\s*-----\s*Original Message\s*-----"),
@@ -58,6 +62,7 @@ class InboxPoller:
         delivery_client,
         logger,
         imap_use_ssl: bool = True,
+        timeout_sec: int = 30,
     ):
         self.imap_host = imap_host
         self.imap_port = int(imap_port or (993 if imap_use_ssl else 143))
@@ -68,6 +73,7 @@ class InboxPoller:
         self.delivery = delivery_client
         self.logger = logger
         self.imap_use_ssl = imap_use_ssl
+        self.timeout_sec = timeout_sec
 
     def configured(self) -> bool:
         return bool(
@@ -82,6 +88,10 @@ class InboxPoller:
         """Process UNSEEN messages in the configured folder. Returns count processed."""
         if not self.configured():
             return 0
+        self.logger.debug(
+            f"IMAP: connecting to {self.imap_host}:{self.imap_port} "
+            f"(ssl={self.imap_use_ssl}, timeout={self.timeout_sec}s)"
+        )
         try:
             conn = self._connect()
         except Exception as exc:
@@ -90,14 +100,28 @@ class InboxPoller:
 
         count = 0
         try:
+            self.logger.debug(f"IMAP: selecting folder '{self.imap_folder}'")
             typ, _ = conn.select(self.imap_folder)
             if typ != "OK":
                 self.logger.warning(f"IMAP: cannot select folder '{self.imap_folder}'")
                 return 0
-            typ, data = conn.search(None, "UNSEEN")
+            # Narrow to digest replies via the [obs-...] subject tag.
+            # imaplib joins string args with spaces; the two double-quoted
+            # tokens keep the bracket literal through the server.
+            self.logger.debug("IMAP: searching UNSEEN SUBJECT [obs-")
+            typ, data = conn.search(None, "UNSEEN", "SUBJECT", '"[obs-"')
             if typ != "OK" or not data or not data[0]:
+                self.logger.debug("IMAP: no matching unseen messages")
                 return 0
-            for uid in data[0].split():
+            uids = data[0].split()
+            if len(uids) > MAX_MESSAGES_PER_POLL:
+                self.logger.warning(
+                    f"IMAP: {len(uids)} matching messages exceeds cap "
+                    f"{MAX_MESSAGES_PER_POLL}; processing the newest {MAX_MESSAGES_PER_POLL}"
+                )
+                uids = uids[-MAX_MESSAGES_PER_POLL:]
+            self.logger.info(f"IMAP: {len(uids)} digest reply candidate(s) to examine")
+            for uid in uids:
                 try:
                     if self._process_message(conn, uid):
                         count += 1
@@ -109,8 +133,7 @@ class InboxPoller:
             except Exception:
                 pass
 
-        if count:
-            self.logger.info(f"Inbox poll: processed {count} reply/replies")
+        self.logger.info(f"Inbox poll: processed {count} reply/replies")
         return count
 
     # ------------------------------------------------------------------
@@ -118,12 +141,27 @@ class InboxPoller:
     # ------------------------------------------------------------------
 
     def _connect(self):
+        # timeout= on the constructor caps the TCP connect handshake
+        # (Python 3.9+). After login, set the socket timeout so every
+        # subsequent read (search, fetch, logout) also respects it —
+        # imaplib otherwise blocks indefinitely if the server stalls.
         if self.imap_use_ssl:
             ctx = ssl.create_default_context()
-            conn = imaplib.IMAP4_SSL(self.imap_host, self.imap_port, ssl_context=ctx)
+            conn = imaplib.IMAP4_SSL(
+                self.imap_host,
+                self.imap_port,
+                ssl_context=ctx,
+                timeout=self.timeout_sec,
+            )
         else:
-            conn = imaplib.IMAP4(self.imap_host, self.imap_port)
+            conn = imaplib.IMAP4(
+                self.imap_host, self.imap_port, timeout=self.timeout_sec
+            )
         conn.login(self.imap_user, self.imap_password)
+        try:
+            conn.sock.settimeout(self.timeout_sec)
+        except Exception:
+            pass
         return conn
 
     def _process_message(self, conn, uid: bytes) -> bool:
