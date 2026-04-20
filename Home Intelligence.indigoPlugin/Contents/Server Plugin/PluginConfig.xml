@@ -190,6 +190,11 @@
         <Description>Indigo variable holding JSON-serialised rules the agent has written. Created automatically on first run.</Description>
     </Field>
 
+    <Field id="observationStoreVariable" type="textfield" defaultValue="home_intelligence_observations">
+        <Label>Observation store variable:</Label>
+        <Description>Indigo variable holding the digest observation history (so the agent doesn't re-suggest things you've already declined). Created automatically on first run.</Description>
+    </Field>
+
     <Field id="ruleEvaluatorIntervalSec" type="textfield" defaultValue="60">
         <Label>Evaluator interval (seconds):</Label>
         <Description>How often to check live device state against agent rules.</Description>

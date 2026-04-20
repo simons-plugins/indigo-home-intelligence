@@ -20,6 +20,7 @@ import indigo
 from history_db import HistoryDB
 from rule_store import RuleStore
 from rule_evaluator import RuleEvaluator
+from observation_store import ObservationStore
 from digest import DigestRunner
 from delivery import DeliveryClient
 from inbox import InboxPoller
@@ -42,6 +43,7 @@ class Plugin(indigo.PluginBase):
         self.history_db = None
         self.rule_store = None
         self.rule_evaluator = None
+        self.observation_store = None
         self.digest = None
         self.delivery = None
         self.inbox = None
@@ -58,6 +60,7 @@ class Plugin(indigo.PluginBase):
         try:
             self._init_history_db()
             self._init_rule_store()
+            self._init_observation_store()
             self.rule_evaluator = RuleEvaluator(self.rule_store, self.logger)
 
             hmac_secret = self._ensure_internal_hmac_secret()
@@ -86,6 +89,7 @@ class Plugin(indigo.PluginBase):
             self.digest = DigestRunner(
                 history_db=self.history_db,
                 rule_store=self.rule_store,
+                observation_store=self.observation_store,
                 delivery=self.delivery,
                 api_key=self.pluginPrefs.get("anthropicApiKey", ""),
                 model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
@@ -199,6 +203,20 @@ class Plugin(indigo.PluginBase):
             f"Disabled {count} agent rule(s). Re-enable individually via the rule store variable."
         )
 
+    def menuShowObservations(self):
+        observations = self.observation_store.list_all() if self.observation_store else []
+        if not observations:
+            self.logger.info("No observations stored.")
+            return
+        self.logger.info(f"Observations ({len(observations)}):")
+        for obs in observations[-10:]:
+            response = obs.get("user_response") or "pending"
+            has_rule = "+rule" if obs.get("proposed_rule") else ""
+            self.logger.info(
+                f"  [{obs.get('id')}] ({response}){has_rule} "
+                f"{obs.get('headline', '(no headline)')}"
+            )
+
     def menuShowStatus(self):
         rules = self.rule_store.list_rules() if self.rule_store else []
         enabled = sum(1 for r in rules if r.get("enabled"))
@@ -262,15 +280,54 @@ class Plugin(indigo.PluginBase):
                 f"Feedback received: obs={observation_id} intent={intent} body_len={len(body_text)}"
             )
 
-            if intent == "yes" and payload.get("proposed_rule"):
-                rule_id = self.rule_store.add_rule(payload["proposed_rule"])
-                self.logger.info(f"Created agent rule {rule_id} from YES reply")
+            observation = (
+                self.observation_store.get(observation_id)
+                if observation_id
+                else None
+            )
+            if observation_id and not observation:
+                self.logger.warning(
+                    f"Feedback references unknown observation {observation_id}"
+                )
+
+            if intent == "yes":
+                proposed_rule = (observation or {}).get("proposed_rule")
+                if not proposed_rule:
+                    self.logger.info(
+                        f"YES reply for {observation_id} but no proposed_rule "
+                        "attached to the observation; recording response only"
+                    )
+                    self.observation_store.record_response(
+                        observation_id, "yes", body=body_text
+                    )
+                    return {"status": "ok", "rule_id": None}
+                rule_id = self.rule_store.add_rule(proposed_rule)
+                self.observation_store.record_response(
+                    observation_id, "yes", body=body_text, rule_id=rule_id
+                )
+                self.logger.info(
+                    f"Created agent rule {rule_id} from YES on observation {observation_id}"
+                )
                 return {"status": "ok", "rule_id": rule_id}
+
             if intent == "no":
+                self.observation_store.record_response(
+                    observation_id, "no", body=body_text
+                )
                 self.logger.info(f"User declined observation {observation_id}")
                 return {"status": "ok"}
 
+            if intent == "snooze":
+                self.observation_store.record_response(
+                    observation_id, "snooze", body=body_text
+                )
+                return {"status": "ok"}
+
             # Free-text query: defer to a future digest-or-ask-Claude path.
+            if observation_id:
+                self.observation_store.record_response(
+                    observation_id, "ignored", body=body_text
+                )
             self.logger.info(
                 "Free-text query received (not yet implemented): "
                 f"{body_text[:120]!r}"
@@ -307,6 +364,15 @@ class Plugin(indigo.PluginBase):
         var_name = self.pluginPrefs.get("ruleStoreVariable", "home_intelligence_rules")
         self.rule_store = RuleStore(variable_name=var_name, logger=self.logger)
         self.rule_store.ensure_variable_exists()
+
+    def _init_observation_store(self):
+        var_name = self.pluginPrefs.get(
+            "observationStoreVariable", "home_intelligence_observations"
+        )
+        self.observation_store = ObservationStore(
+            variable_name=var_name, logger=self.logger
+        )
+        self.observation_store.ensure_variable_exists()
 
     def _ensure_internal_hmac_secret(self) -> str:
         """Generate the HMAC secret used to authenticate inbox→/feedback POSTs.
