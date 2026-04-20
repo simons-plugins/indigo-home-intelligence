@@ -56,7 +56,6 @@ class AnthropicClient:
         system_blocks: List[dict],
         user_message: str,
         max_tokens: Optional[int] = None,
-        output_schema: Optional[dict] = None,
     ) -> dict:
         """
         Call /v1/messages. Returns the parsed response dict.
@@ -66,8 +65,10 @@ class AnthropicClient:
         prefix first with cache_control on the last stable block; put
         volatile content in `user_message`.
 
-        If `output_schema` is provided, the response's first text block
-        is guaranteed to contain JSON matching the schema.
+        Callers get raw text back via extract_text(); JSON parsing and
+        schema validation are their responsibility. The Messages API
+        does not support server-side schema enforcement on free text —
+        use tool-use forcing if hard structure is required.
         """
         if not self.configured():
             raise AnthropicError("Anthropic API key is not configured")
@@ -78,10 +79,6 @@ class AnthropicClient:
             "system": system_blocks,
             "messages": [{"role": "user", "content": user_message}],
         }
-        if output_schema is not None:
-            body["output_config"] = {
-                "format": {"type": "json_schema", "schema": output_schema}
-            }
 
         data = json.dumps(body).encode("utf-8")
         req = urllib.request.Request(

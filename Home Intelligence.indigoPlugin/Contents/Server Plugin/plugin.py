@@ -32,10 +32,27 @@ DAYS_OF_WEEK = {
 }
 
 
+def _as_bool(value, default: bool = False) -> bool:
+    """Coerce an Indigo checkbox pref to a real bool.
+
+    Indigo stores checkbox values as the strings "true" / "false" in
+    pluginPrefs, so bool() against them is always True. This helper
+    accepts real bools (from code), Indigo strings, common synonyms
+    ("yes", "no", "1", "0"), and None.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value).strip().lower() in ("true", "1", "yes", "on")
+
+
 class Plugin(indigo.PluginBase):
     def __init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs):
         super().__init__(pluginId, pluginDisplayName, pluginVersion, pluginPrefs)
-        self.debug = pluginPrefs.get("showDebugInfo", False)
+        self.debug = _as_bool(pluginPrefs.get("showDebugInfo"), False)
         self.history_db = None
         self.rule_store = None
         self.rule_evaluator = None
@@ -71,7 +88,7 @@ class Plugin(indigo.PluginBase):
         take effect without a plugin restart."""
         if userCancelled:
             return
-        self.debug = valuesDict.get("showDebugInfo", False)
+        self.debug = _as_bool(valuesDict.get("showDebugInfo"), False)
         try:
             self._init_history_db()
             self._rebuild_clients()
@@ -91,7 +108,7 @@ class Plugin(indigo.PluginBase):
             from_address=self.pluginPrefs.get("smtpFromAddress", ""),
             default_to=self.pluginPrefs.get("digestEmailTo", ""),
             hmac_secret=hmac_secret,
-            smtp_use_ssl=bool(self.pluginPrefs.get("smtpUseSsl", True)),
+            smtp_use_ssl=_as_bool(self.pluginPrefs.get("smtpUseSsl"), True),
             logger=self.logger,
         )
         self.inbox = InboxPoller(
@@ -101,7 +118,7 @@ class Plugin(indigo.PluginBase):
             imap_password=self.pluginPrefs.get("imapPassword", ""),
             imap_folder=self.pluginPrefs.get("imapFolder", "INBOX"),
             feedback_callback=self._dispatch_feedback,
-            imap_use_ssl=bool(self.pluginPrefs.get("imapUseSsl", True)),
+            imap_use_ssl=_as_bool(self.pluginPrefs.get("imapUseSsl"), True),
             logger=self.logger,
         )
         self.digest = DigestRunner(
@@ -130,7 +147,7 @@ class Plugin(indigo.PluginBase):
             pass
 
     def _tick_rule_evaluator(self):
-        if not self.pluginPrefs.get("rulesEnabled", True):
+        if not _as_bool(self.pluginPrefs.get("rulesEnabled"), True):
             return
         interval = int(self.pluginPrefs.get("ruleEvaluatorIntervalSec", 60) or 60)
         now = datetime.now(timezone.utc).timestamp()
@@ -293,9 +310,16 @@ class Plugin(indigo.PluginBase):
     def _dispatch_feedback(self, payload: dict) -> dict:
         """Process a decoded feedback payload. Called directly by the inbox
         poller (same process, no HMAC needed) and via handle_feedback for
-        HTTP callers. Always returns a dict with a 'status' key."""
+        HTTP callers.
+
+        Contract: returns a dict with a `status` key. Any status other
+        than 'ok' or 'accepted' causes the inbox poller to leave the
+        source message UNSEEN for retry — so unknown observations and
+        failures should report an error status rather than silently
+        succeed.
+        """
         observation_id = payload.get("observation_id")
-        intent = payload.get("intent")  # "yes" | "no" | "query" | "snooze"
+        intent = payload.get("intent")
         body_text = payload.get("body", "")
 
         self.logger.info(
@@ -303,51 +327,86 @@ class Plugin(indigo.PluginBase):
             f"body_len={len(body_text)}"
         )
 
-        observation = (
-            self.observation_store.get(observation_id) if observation_id else None
-        )
-        if observation_id and not observation:
+        if not observation_id:
+            self.logger.warning("Feedback received with no observation_id; refusing")
+            return {"status": "error", "detail": "missing_observation_id"}
+
+        observation = self.observation_store.get(observation_id)
+        if observation is None:
+            # Leave UNSEEN — either the store is out of sync or the reply
+            # matched some unrelated threading ID. The user can re-trigger
+            # by marking read/unread if genuinely spurious.
             self.logger.warning(
-                f"Feedback references unknown observation {observation_id}"
+                f"Feedback references unknown observation {observation_id}; "
+                "returning error so inbox poller leaves message UNSEEN"
             )
+            return {"status": "error", "detail": "unknown_observation"}
 
         if intent == "yes":
-            proposed_rule = (observation or {}).get("proposed_rule")
+            # Idempotency guard: if we've already created a rule for this
+            # observation (e.g. previous poll succeeded but the IMAP \Seen
+            # flag set failed, causing the message to be re-delivered),
+            # short-circuit and report the existing rule. No duplicate
+            # rules, no second record_response overwrite.
+            existing_rule_id = observation.get("rule_id")
+            if existing_rule_id:
+                self.logger.info(
+                    f"Observation {observation_id} already has rule "
+                    f"{existing_rule_id}; treating YES as duplicate and "
+                    "returning existing rule_id"
+                )
+                return {"status": "ok", "rule_id": existing_rule_id, "duplicate": True}
+
+            proposed_rule = observation.get("proposed_rule")
             if not proposed_rule:
                 self.logger.info(
                     f"YES reply for {observation_id} but no proposed_rule "
-                    "attached to the observation; recording response only"
+                    "attached; recording response only"
                 )
-                self.observation_store.record_response(
+                if not self.observation_store.record_response(
                     observation_id, "yes", body=body_text
-                )
+                ):
+                    self.logger.warning(
+                        f"record_response failed for {observation_id} (YES, no rule)"
+                    )
                 return {"status": "ok", "rule_id": None}
+
             rule_id = self.rule_store.add_rule(proposed_rule)
-            self.observation_store.record_response(
+            if not self.observation_store.record_response(
                 observation_id, "yes", body=body_text, rule_id=rule_id
-            )
+            ):
+                self.logger.warning(
+                    f"record_response failed for {observation_id} after adding "
+                    f"rule {rule_id}; rule is created but observation not updated"
+                )
             self.logger.info(
                 f"Created agent rule {rule_id} from YES on observation {observation_id}"
             )
             return {"status": "ok", "rule_id": rule_id}
 
         if intent == "no":
-            self.observation_store.record_response(
+            if not self.observation_store.record_response(
                 observation_id, "no", body=body_text
-            )
+            ):
+                self.logger.warning(f"record_response failed for {observation_id} (NO)")
             self.logger.info(f"User declined observation {observation_id}")
             return {"status": "ok"}
 
         if intent == "snooze":
-            self.observation_store.record_response(
+            if not self.observation_store.record_response(
                 observation_id, "snooze", body=body_text
-            )
+            ):
+                self.logger.warning(
+                    f"record_response failed for {observation_id} (SNOOZE)"
+                )
             return {"status": "ok"}
 
         # Free-text query: defer to a future digest-or-ask-Claude path.
-        if observation_id:
-            self.observation_store.record_response(
-                observation_id, "ignored", body=body_text
+        if not self.observation_store.record_response(
+            observation_id, "ignored", body=body_text
+        ):
+            self.logger.warning(
+                f"record_response failed for {observation_id} (free-text query)"
             )
         self.logger.info(
             "Free-text query received (not yet implemented): "

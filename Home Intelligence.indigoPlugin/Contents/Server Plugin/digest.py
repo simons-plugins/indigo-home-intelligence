@@ -175,6 +175,14 @@ class DigestRunner:
             )
             return None
 
+        validation_error = self._validate_parsed(parsed)
+        if validation_error is not None:
+            self.logger.error(
+                f"Digest: Claude output failed schema validation: {validation_error}. "
+                f"First 500 chars of raw: {raw_text[:500]!r}"
+            )
+            return None
+
         return self._deliver(parsed)
 
     # ------------------------------------------------------------------
@@ -260,6 +268,75 @@ class DigestRunner:
     # ------------------------------------------------------------------
     # Output handling
     # ------------------------------------------------------------------
+
+    _ALLOWED_RULE_OPS = {"on", "off", "toggle", "set_brightness"}
+
+    @classmethod
+    def _validate_parsed(cls, parsed: object) -> Optional[str]:
+        """Check that a parsed JSON response matches the documented digest
+        schema. Returns None on success, a short error string on failure.
+
+        Strict enough to catch "model returned garbage" / "model returned
+        the example block instead of the answer" / "proposed_rule missing
+        required fields". Permissive about optional fields (related_devices
+        defaulting to empty, etc.)."""
+        if not isinstance(parsed, dict):
+            return f"top-level is {type(parsed).__name__}, expected object"
+
+        subject = parsed.get("subject")
+        if not isinstance(subject, str) or not subject.strip():
+            return "subject missing or empty"
+
+        narrative = parsed.get("narrative_markdown")
+        if not isinstance(narrative, str) or not narrative.strip():
+            return "narrative_markdown missing or empty"
+
+        observation = parsed.get("observation")
+        if observation is None:
+            return None  # informational-only digest, valid
+
+        if not isinstance(observation, dict):
+            return f"observation is {type(observation).__name__}, expected object or null"
+
+        if not isinstance(observation.get("headline"), str) or not observation["headline"].strip():
+            return "observation.headline missing or empty"
+        if not isinstance(observation.get("rationale"), str):
+            return "observation.rationale missing or not a string"
+        related = observation.get("related_devices")
+        if related is not None and not (
+            isinstance(related, list) and all(isinstance(x, int) for x in related)
+        ):
+            return "observation.related_devices must be a list of ints"
+
+        rule = observation.get("proposed_rule")
+        if rule is None:
+            return None  # observation with no actionable rule, valid
+
+        if not isinstance(rule, dict):
+            return f"proposed_rule is {type(rule).__name__}, expected object or null"
+        if not isinstance(rule.get("description"), str) or not rule["description"].strip():
+            return "proposed_rule.description missing or empty"
+
+        when = rule.get("when")
+        if not isinstance(when, dict):
+            return "proposed_rule.when missing or not an object"
+        if not isinstance(when.get("device_id"), int):
+            return "proposed_rule.when.device_id must be an int"
+        if not isinstance(when.get("state"), str) or not when["state"]:
+            return "proposed_rule.when.state missing or empty"
+        if "equals" not in when:
+            return "proposed_rule.when.equals is required"
+
+        then = rule.get("then")
+        if not isinstance(then, dict):
+            return "proposed_rule.then missing or not an object"
+        if not isinstance(then.get("device_id"), int):
+            return "proposed_rule.then.device_id must be an int"
+        op = then.get("op")
+        if op not in cls._ALLOWED_RULE_OPS:
+            return f"proposed_rule.then.op must be one of {sorted(cls._ALLOWED_RULE_OPS)}, got {op!r}"
+
+        return None
 
     _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```\s*$", re.IGNORECASE | re.DOTALL)
 
