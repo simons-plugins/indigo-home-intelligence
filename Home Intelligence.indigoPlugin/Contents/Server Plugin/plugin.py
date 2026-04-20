@@ -62,46 +62,63 @@ class Plugin(indigo.PluginBase):
             self._init_rule_store()
             self._init_observation_store()
             self.rule_evaluator = RuleEvaluator(self.rule_store, self.logger)
-
-            hmac_secret = self._ensure_internal_hmac_secret()
-            self.delivery = DeliveryClient(
-                smtp_host=self.pluginPrefs.get("smtpHost", ""),
-                smtp_port=self.pluginPrefs.get("smtpPort", "465"),
-                smtp_user=self.pluginPrefs.get("smtpUser", ""),
-                smtp_password=self.pluginPrefs.get("smtpPassword", ""),
-                from_address=self.pluginPrefs.get("smtpFromAddress", ""),
-                default_to=self.pluginPrefs.get("digestEmailTo", ""),
-                hmac_secret=hmac_secret,
-                smtp_use_ssl=bool(self.pluginPrefs.get("smtpUseSsl", True)),
-                logger=self.logger,
-            )
-            self.inbox = InboxPoller(
-                imap_host=self.pluginPrefs.get("imapHost", ""),
-                imap_port=self.pluginPrefs.get("imapPort", "993"),
-                imap_user=self.pluginPrefs.get("imapUser", ""),
-                imap_password=self.pluginPrefs.get("imapPassword", ""),
-                imap_folder=self.pluginPrefs.get("imapFolder", "INBOX"),
-                feedback_url=self.pluginPrefs.get("feedbackUrl", DEFAULT_FEEDBACK_URL),
-                delivery_client=self.delivery,
-                imap_use_ssl=bool(self.pluginPrefs.get("imapUseSsl", True)),
-                logger=self.logger,
-            )
-            self.digest = DigestRunner(
-                history_db=self.history_db,
-                rule_store=self.rule_store,
-                observation_store=self.observation_store,
-                delivery=self.delivery,
-                api_key=self.pluginPrefs.get("anthropicApiKey", ""),
-                model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
-                email_to=self.pluginPrefs.get("digestEmailTo", ""),
-                logger=self.logger,
-            )
+            self._rebuild_clients()
             self.logger.info("Home Intelligence startup complete")
         except Exception as exc:
             self.logger.exception(f"Startup failed: {exc}")
 
     def shutdown(self):
         self.logger.info("Home Intelligence shutting down")
+
+    def closedPrefsConfigUi(self, valuesDict, userCancelled):
+        """Rebuild the SMTP/IMAP/Claude clients when prefs change so edits
+        take effect without a plugin restart."""
+        if userCancelled:
+            return
+        self.debug = valuesDict.get("showDebugInfo", False)
+        try:
+            self._init_history_db()
+            self._rebuild_clients()
+            self.logger.info("Configuration updated; clients rebuilt")
+        except Exception as exc:
+            self.logger.exception(f"Rebuild after config change failed: {exc}")
+
+    def _rebuild_clients(self):
+        """Construct DeliveryClient, InboxPoller, and DigestRunner from current
+        pluginPrefs. Called from startup() and closedPrefsConfigUi()."""
+        hmac_secret = self._ensure_internal_hmac_secret()
+        self.delivery = DeliveryClient(
+            smtp_host=self.pluginPrefs.get("smtpHost", ""),
+            smtp_port=self.pluginPrefs.get("smtpPort", "465"),
+            smtp_user=self.pluginPrefs.get("smtpUser", ""),
+            smtp_password=self.pluginPrefs.get("smtpPassword", ""),
+            from_address=self.pluginPrefs.get("smtpFromAddress", ""),
+            default_to=self.pluginPrefs.get("digestEmailTo", ""),
+            hmac_secret=hmac_secret,
+            smtp_use_ssl=bool(self.pluginPrefs.get("smtpUseSsl", True)),
+            logger=self.logger,
+        )
+        self.inbox = InboxPoller(
+            imap_host=self.pluginPrefs.get("imapHost", ""),
+            imap_port=self.pluginPrefs.get("imapPort", "993"),
+            imap_user=self.pluginPrefs.get("imapUser", ""),
+            imap_password=self.pluginPrefs.get("imapPassword", ""),
+            imap_folder=self.pluginPrefs.get("imapFolder", "INBOX"),
+            feedback_url=self.pluginPrefs.get("feedbackUrl", DEFAULT_FEEDBACK_URL),
+            delivery_client=self.delivery,
+            imap_use_ssl=bool(self.pluginPrefs.get("imapUseSsl", True)),
+            logger=self.logger,
+        )
+        self.digest = DigestRunner(
+            history_db=self.history_db,
+            rule_store=self.rule_store,
+            observation_store=self.observation_store,
+            delivery=self.delivery,
+            api_key=self.pluginPrefs.get("anthropicApiKey", ""),
+            model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
+            email_to=self.pluginPrefs.get("digestEmailTo", ""),
+            logger=self.logger,
+        )
 
     # ------------------------------------------------------------------
     # Main loop
