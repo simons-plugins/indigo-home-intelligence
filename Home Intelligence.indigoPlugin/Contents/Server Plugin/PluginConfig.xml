@@ -100,26 +100,86 @@
     </Field>
 
     <Field id="digestEmailTo" type="textfield" defaultValue="">
-        <Label>Send to email:</Label>
+        <Label>Send digest to:</Label>
+        <Description>Recipient email address for the weekly digest.</Description>
     </Field>
 
     <Field id="separator4" type="separator" />
 
-    <Field id="deliveryLabel" type="label">
-        <Label>Delivery (Cloudflare Worker)</Label>
+    <Field id="smtpLabel" type="label">
+        <Label>Outbound Email (SMTP)</Label>
     </Field>
 
-    <Field id="deliveryWorkerUrl" type="textfield" defaultValue="https://push.domio-smart-home.app">
-        <Label>Worker URL:</Label>
-        <Description>Shares the existing domio-push-relay. Uses /email-out and /email-in routes.</Description>
+    <Field id="smtpLabelHelp" type="label" fontSize="small" fontColor="darkgray">
+        <Label>Gmail users: generate an app-specific password at myaccount.google.com/apppasswords. iCloud users: use an app-specific password from appleid.apple.com. Defaults below assume TLS on 465.</Label>
     </Field>
 
-    <Field id="deliveryHmacSecret" type="textfield" defaultValue="" secure="true">
-        <Label>HMAC shared secret:</Label>
-        <Description>Must match the relay's HOME_INTELLIGENCE_HMAC_SECRET env var.</Description>
+    <Field id="smtpHost" type="textfield" defaultValue="smtp.gmail.com">
+        <Label>SMTP host:</Label>
+    </Field>
+
+    <Field id="smtpPort" type="textfield" defaultValue="465">
+        <Label>SMTP port:</Label>
+    </Field>
+
+    <Field id="smtpUseSsl" type="checkbox" defaultValue="true">
+        <Label>Use SSL (port 465):</Label>
+        <Description>Uncheck to use STARTTLS on port 587 instead.</Description>
+    </Field>
+
+    <Field id="smtpUser" type="textfield" defaultValue="">
+        <Label>SMTP username:</Label>
+    </Field>
+
+    <Field id="smtpPassword" type="textfield" defaultValue="" secure="true">
+        <Label>SMTP password:</Label>
+        <Description>App-specific password for Gmail / iCloud. Stored securely in Indigo prefs.</Description>
+    </Field>
+
+    <Field id="smtpFromAddress" type="textfield" defaultValue="">
+        <Label>From address (blank = same as username):</Label>
     </Field>
 
     <Field id="separator5" type="separator" />
+
+    <Field id="imapLabel" type="label">
+        <Label>Inbound Replies (IMAP)</Label>
+    </Field>
+
+    <Field id="imapLabelHelp" type="label" fontSize="small" fontColor="darkgray">
+        <Label>Polled periodically for YES/NO/SNOOZE replies to the digest. Use the same mailbox the digest is sent to.</Label>
+    </Field>
+
+    <Field id="imapHost" type="textfield" defaultValue="imap.gmail.com">
+        <Label>IMAP host:</Label>
+    </Field>
+
+    <Field id="imapPort" type="textfield" defaultValue="993">
+        <Label>IMAP port:</Label>
+    </Field>
+
+    <Field id="imapUseSsl" type="checkbox" defaultValue="true">
+        <Label>Use SSL (port 993):</Label>
+    </Field>
+
+    <Field id="imapUser" type="textfield" defaultValue="">
+        <Label>IMAP username:</Label>
+    </Field>
+
+    <Field id="imapPassword" type="textfield" defaultValue="" secure="true">
+        <Label>IMAP password:</Label>
+    </Field>
+
+    <Field id="imapFolder" type="textfield" defaultValue="INBOX">
+        <Label>Folder to poll:</Label>
+        <Description>Create a filter that labels digest replies into a dedicated folder (e.g. 'indigo-feedback') for tidier polling.</Description>
+    </Field>
+
+    <Field id="inboxPollIntervalMin" type="textfield" defaultValue="5">
+        <Label>Poll interval (minutes):</Label>
+    </Field>
+
+    <Field id="separator6" type="separator" />
 
     <Field id="rulesLabel" type="label">
         <Label>Agent Rules</Label>

@@ -1,15 +1,19 @@
 """
 Home Intelligence - Indigo plugin.
 
-Produces a weekly digest from SQL Logger history via a Claude model, emails it
-out via the domio-push-relay Cloudflare Worker, and enforces agent-proposed
-rules the user has approved (Pattern 1: plugin-internal rule engine, Auto
-Lights style - because indigo.trigger.create() does not exist).
+Produces a weekly digest from SQL Logger history via a Claude model, sends
+it out over the user's SMTP server, polls their IMAP inbox for YES/NO
+replies, and enforces agent-proposed rules the user has approved
+(Pattern 1: plugin-internal rule engine, Auto Lights style - because
+indigo.trigger.create() does not exist).
+
+See ADR-0002 for the email-in/out decision.
 """
 
 import json
+import secrets
 import traceback
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 import indigo
 
@@ -18,12 +22,17 @@ from rule_store import RuleStore
 from rule_evaluator import RuleEvaluator
 from digest import DigestRunner
 from delivery import DeliveryClient
+from inbox import InboxPoller
 
 
 DAYS_OF_WEEK = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
     "friday": 4, "saturday": 5, "sunday": 6,
 }
+
+DEFAULT_FEEDBACK_URL = (
+    "http://127.0.0.1:8176/message/com.simons-plugins.home-intelligence/feedback"
+)
 
 
 class Plugin(indigo.PluginBase):
@@ -35,7 +44,9 @@ class Plugin(indigo.PluginBase):
         self.rule_evaluator = None
         self.digest = None
         self.delivery = None
+        self.inbox = None
         self._last_eval_at = 0.0
+        self._last_inbox_poll_at = 0.0
         self._last_digest_date = None
 
     # ------------------------------------------------------------------
@@ -48,9 +59,28 @@ class Plugin(indigo.PluginBase):
             self._init_history_db()
             self._init_rule_store()
             self.rule_evaluator = RuleEvaluator(self.rule_store, self.logger)
+
+            hmac_secret = self._ensure_internal_hmac_secret()
             self.delivery = DeliveryClient(
-                worker_url=self.pluginPrefs.get("deliveryWorkerUrl", ""),
-                hmac_secret=self.pluginPrefs.get("deliveryHmacSecret", ""),
+                smtp_host=self.pluginPrefs.get("smtpHost", ""),
+                smtp_port=self.pluginPrefs.get("smtpPort", "465"),
+                smtp_user=self.pluginPrefs.get("smtpUser", ""),
+                smtp_password=self.pluginPrefs.get("smtpPassword", ""),
+                from_address=self.pluginPrefs.get("smtpFromAddress", ""),
+                default_to=self.pluginPrefs.get("digestEmailTo", ""),
+                hmac_secret=hmac_secret,
+                smtp_use_ssl=bool(self.pluginPrefs.get("smtpUseSsl", True)),
+                logger=self.logger,
+            )
+            self.inbox = InboxPoller(
+                imap_host=self.pluginPrefs.get("imapHost", ""),
+                imap_port=self.pluginPrefs.get("imapPort", "993"),
+                imap_user=self.pluginPrefs.get("imapUser", ""),
+                imap_password=self.pluginPrefs.get("imapPassword", ""),
+                imap_folder=self.pluginPrefs.get("imapFolder", "INBOX"),
+                feedback_url=self.pluginPrefs.get("feedbackUrl", DEFAULT_FEEDBACK_URL),
+                delivery_client=self.delivery,
+                imap_use_ssl=bool(self.pluginPrefs.get("imapUseSsl", True)),
                 logger=self.logger,
             )
             self.digest = DigestRunner(
@@ -77,6 +107,7 @@ class Plugin(indigo.PluginBase):
         try:
             while True:
                 self._tick_rule_evaluator()
+                self._tick_inbox_poller()
                 self._tick_digest_clock()
                 self.sleep(10)
         except self.StopThread:
@@ -94,6 +125,23 @@ class Plugin(indigo.PluginBase):
             self.rule_evaluator.tick()
         except Exception as exc:
             self.logger.exception(f"Rule evaluator tick failed: {exc}")
+
+    def _tick_inbox_poller(self):
+        if not self.inbox or not self.inbox.configured():
+            return
+        try:
+            interval_min = float(self.pluginPrefs.get("inboxPollIntervalMin", 5) or 5)
+        except (TypeError, ValueError):
+            interval_min = 5.0
+        interval_sec = max(30.0, interval_min * 60.0)
+        now = datetime.now(timezone.utc).timestamp()
+        if now - self._last_inbox_poll_at < interval_sec:
+            return
+        self._last_inbox_poll_at = now
+        try:
+            self.inbox.poll()
+        except Exception as exc:
+            self.logger.exception(f"Inbox poll failed: {exc}")
 
     def _tick_digest_clock(self):
         target_day = DAYS_OF_WEEK.get(
@@ -147,7 +195,9 @@ class Plugin(indigo.PluginBase):
 
     def menuDisableAllRules(self):
         count = self.rule_store.disable_all()
-        self.logger.warning(f"Disabled {count} agent rule(s). Re-enable individually via the rule store variable.")
+        self.logger.warning(
+            f"Disabled {count} agent rule(s). Re-enable individually via the rule store variable."
+        )
 
     def menuShowStatus(self):
         rules = self.rule_store.list_rules() if self.rule_store else []
@@ -156,8 +206,21 @@ class Plugin(indigo.PluginBase):
             "Home Intelligence status: "
             f"{len(rules)} rules ({enabled} enabled), "
             f"digest model={self.pluginPrefs.get('anthropicModel')}, "
-            f"next digest day={self.pluginPrefs.get('digestDay')} at {self.pluginPrefs.get('digestTime')}"
+            f"next digest day={self.pluginPrefs.get('digestDay')} at {self.pluginPrefs.get('digestTime')}, "
+            f"SMTP={'configured' if self.delivery and self.delivery._configured() else 'NOT configured'}, "
+            f"IMAP={'configured' if self.inbox and self.inbox.configured() else 'NOT configured'}"
         )
+
+    def menuPollInboxNow(self):
+        self.logger.info("Menu: Poll Inbox Now")
+        if not self.inbox or not self.inbox.configured():
+            self.logger.warning("IMAP not configured; poll skipped")
+            return
+        try:
+            count = self.inbox.poll()
+            self.logger.info(f"Poll complete: {count} reply/replies processed")
+        except Exception as exc:
+            self.logger.exception(f"Manual inbox poll failed: {exc}")
 
     def menuToggleDebug(self):
         self.debug = not self.debug
@@ -173,7 +236,8 @@ class Plugin(indigo.PluginBase):
         return {"status": "ok", "plugin": "home-intelligence"}
 
     def handle_feedback(self, action, dev=None, callerWaitingForResult=None):
-        """Receive signed feedback from the Worker (inbound email -> rule decision)."""
+        """Receive signed feedback (from inbox.py, or any other channel posting
+        to this endpoint with a matching HMAC signature)."""
         try:
             body_props = action.props.get("body_params", indigo.Dict()) or indigo.Dict()
             raw_body = action.props.get("request_body", b"")
@@ -183,7 +247,7 @@ class Plugin(indigo.PluginBase):
 
             signature = (
                 action.props.get("headers", indigo.Dict()).get("X-HI-Signature")
-                or payload.get("signature")
+                or payload.pop("signature", None)
             )
 
             if not self.delivery.verify_signature(payload, signature):
@@ -243,3 +307,19 @@ class Plugin(indigo.PluginBase):
         var_name = self.pluginPrefs.get("ruleStoreVariable", "home_intelligence_rules")
         self.rule_store = RuleStore(variable_name=var_name, logger=self.logger)
         self.rule_store.ensure_variable_exists()
+
+    def _ensure_internal_hmac_secret(self) -> str:
+        """Generate the HMAC secret used to authenticate inbox→/feedback POSTs.
+        Not user-configurable — it's purely internal. Stored in pluginPrefs
+        on first startup so it survives restarts."""
+        secret = self.pluginPrefs.get("internalHmacSecret", "")
+        if secret:
+            return secret
+        secret = secrets.token_hex(32)
+        self.pluginPrefs["internalHmacSecret"] = secret
+        try:
+            indigo.server.savePluginPrefs()
+        except Exception as exc:
+            self.logger.warning(f"Could not persist internal HMAC secret: {exc}")
+        self.logger.info("Generated internal HMAC secret for /feedback endpoint")
+        return secret

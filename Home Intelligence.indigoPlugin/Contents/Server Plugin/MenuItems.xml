@@ -12,6 +12,10 @@
         <Name>Disable All Agent Rules</Name>
         <CallbackMethod>menuDisableAllRules</CallbackMethod>
     </MenuItem>
+    <MenuItem id="pollInboxNow">
+        <Name>Poll Inbox Now</Name>
+        <CallbackMethod>menuPollInboxNow</CallbackMethod>
+    </MenuItem>
     <MenuItem id="showStatus">
         <Name>Show Status</Name>
         <CallbackMethod>menuShowStatus</CallbackMethod>
