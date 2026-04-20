@@ -59,21 +59,59 @@ class RuleStore:
     def _read(self) -> list:
         try:
             raw = indigo.variables[self.variable_name].value
-            data = json.loads(raw) if raw else []
-            if not isinstance(data, list):
-                self.logger.warning(
-                    f"Rule store variable '{self.variable_name}' is not a JSON array; resetting"
-                )
-                return []
-            return data
         except KeyError:
-            self.logger.warning(f"Rule store variable '{self.variable_name}' missing on read")
-            return []
-        except json.JSONDecodeError as exc:
-            self.logger.error(f"Rule store JSON parse failed: {exc}; treating as empty")
+            self.logger.warning(
+                f"Rule store variable '{self.variable_name}' missing on read; "
+                "ensuring and returning empty"
+            )
+            self.ensure_variable_exists()
             return []
 
+        if not raw:
+            return []
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            self._backup_corrupt(raw, str(exc))
+            return []
+
+        if not isinstance(data, list):
+            self.logger.warning(
+                f"Rule store variable '{self.variable_name}' is not a JSON array; "
+                "backing up and resetting"
+            )
+            self._backup_corrupt(raw, "value is not a JSON array")
+            return []
+        return data
+
+    def _backup_corrupt(self, raw_value: str, reason: str) -> None:
+        """Preserve a corrupted JSON blob to a sibling variable before any
+        subsequent _write overwrites it. Called from _read on parse failure."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_name = f"{self.variable_name}__corrupt_{stamp}"
+        try:
+            if backup_name not in indigo.variables:
+                indigo.variable.create(backup_name, value=raw_value)
+                self.logger.error(
+                    f"Rule store JSON invalid ({reason}); raw value backed up to "
+                    f"variable '{backup_name}'. Continuing with empty state; next "
+                    "write will replace the corrupt blob. Inspect the backup variable "
+                    "if you need to recover anything."
+                )
+            else:
+                self.logger.error(
+                    f"Rule store JSON invalid ({reason}); backup variable "
+                    f"'{backup_name}' already exists, preserving existing backup"
+                )
+        except Exception as exc:
+            self.logger.exception(
+                f"Rule store corrupt AND backup also failed: {exc}; "
+                f"raw value (first 500 chars): {raw_value[:500]!r}"
+            )
+
     def _write(self, rules: list) -> None:
+        if self.variable_name not in indigo.variables:
+            self.ensure_variable_exists()
         indigo.variable.updateValue(self.variable_name, value=json.dumps(rules, indent=2))
 
     # ------------------------------------------------------------------

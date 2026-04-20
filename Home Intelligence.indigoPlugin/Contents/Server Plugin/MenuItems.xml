@@ -8,9 +8,17 @@
         <Name>Show Agent Rules</Name>
         <CallbackMethod>menuShowAgentRules</CallbackMethod>
     </MenuItem>
+    <MenuItem id="showObservations">
+        <Name>Show Observations</Name>
+        <CallbackMethod>menuShowObservations</CallbackMethod>
+    </MenuItem>
     <MenuItem id="disableAllRules">
         <Name>Disable All Agent Rules</Name>
         <CallbackMethod>menuDisableAllRules</CallbackMethod>
+    </MenuItem>
+    <MenuItem id="pollInboxNow">
+        <Name>Poll Inbox Now</Name>
+        <CallbackMethod>menuPollInboxNow</CallbackMethod>
     </MenuItem>
     <MenuItem id="showStatus">
         <Name>Show Status</Name>

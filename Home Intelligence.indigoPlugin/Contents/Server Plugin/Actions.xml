@@ -1,13 +1,17 @@
 <?xml version="1.0"?>
 <Actions>
-    <!-- IWS HTTP endpoint for the Cloudflare Worker to forward inbound email.
-         Hidden from the Indigo UI. Called as POST /message/com.simons-plugins.home-intelligence/feedback -->
+    <!-- IWS HTTP endpoint for external feedback channels (future iMessage
+         plugin, webhooks, etc). Hidden from the Indigo UI. Requests are
+         verified against an internal HMAC-SHA256 signature. The inbox
+         poller bypasses this and calls _dispatch_feedback directly,
+         so this route is currently unused in-tree.
+         URL: POST /message/com.simons-plugins.home-intelligence/feedback -->
     <Action id="feedback" uiPath="hidden">
-        <Name>Feedback Webhook (from Worker)</Name>
+        <Name>Feedback Webhook</Name>
         <CallbackMethod>handle_feedback</CallbackMethod>
     </Action>
 
-    <!-- Health check for the Worker to verify the plugin is reachable. -->
+    <!-- Health check endpoint. Unauthenticated; returns plugin name. -->
     <Action id="status" uiPath="hidden">
         <Name>Plugin Status (HTTP)</Name>
         <CallbackMethod>handle_status</CallbackMethod>
