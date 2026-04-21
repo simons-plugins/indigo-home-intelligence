@@ -85,7 +85,7 @@ class InboxPoller:
         feedback_callback: Callable[[dict], dict],
         logger,
         imap_use_ssl: bool = True,
-        timeout_sec: int = 30,
+        timeout_sec: int = 60,
     ):
         self.imap_host = imap_host
         self.imap_port = int(imap_port or (993 if imap_use_ssl else 143))
@@ -132,45 +132,57 @@ class InboxPoller:
 
         count = 0
         try:
-            self.logger.debug(f"IMAP: selecting folder '{self.imap_folder}'")
-            typ, _ = conn.select(self.imap_folder)
-            if typ != "OK":
+            try:
+                self.logger.debug(f"IMAP: selecting folder '{self.imap_folder}'")
+                typ, _ = conn.select(self.imap_folder)
+                if typ != "OK":
+                    raise InboxPollError(
+                        f"IMAP cannot select folder '{self.imap_folder}' (response={typ})"
+                    )
+                # Target replies to our digest by the In-Reply-To header. The
+                # digest Message-ID is stamped as "<hi-<replyid>-...@domain>"
+                # so any reply in the same thread carries it in In-Reply-To.
+                # (Subject search was tried first but Gmail tokenises SUBJECT
+                # at indexing time and won't substring-match "[obs-".)
+                self.logger.debug("IMAP: searching UNSEEN HEADER In-Reply-To hi-")
+                typ, data = conn.search(
+                    None, "UNSEEN", "HEADER", "In-Reply-To", '"hi-"'
+                )
+                if typ != "OK" or not data or not data[0]:
+                    # Fallback: subject tag match for non-Gmail servers or
+                    # clients that strip threading headers.
+                    self.logger.debug(
+                        'IMAP: no In-Reply-To match; trying SUBJECT "[obs-"'
+                    )
+                    typ, data = conn.search(None, "UNSEEN", "SUBJECT", '"[obs-"')
+                if typ != "OK" or not data or not data[0]:
+                    self.logger.debug("IMAP: no matching unseen messages")
+                    return 0
+                uids = data[0].split()
+                if len(uids) > MAX_MESSAGES_PER_POLL:
+                    self.logger.warning(
+                        f"IMAP: {len(uids)} matching messages exceeds cap "
+                        f"{MAX_MESSAGES_PER_POLL}; processing the newest {MAX_MESSAGES_PER_POLL}"
+                    )
+                    uids = uids[-MAX_MESSAGES_PER_POLL:]
+                self.logger.info(f"IMAP: {len(uids)} digest reply candidate(s) to examine")
+                for uid in uids:
+                    try:
+                        if self._process_message(conn, uid):
+                            count += 1
+                    except Exception as exc:
+                        self.logger.exception(f"Processing IMAP message {uid!r} failed: {exc}")
+            except InboxPollError:
+                raise
+            except (TimeoutError, OSError, imaplib.IMAP4.abort, imaplib.IMAP4.error) as exc:
+                # Network-ish errors on SELECT / SEARCH / FETCH. Common
+                # on Gmail when SEARCH over a large mailbox is slow or
+                # when the session gets reaped. Reclassify as a
+                # transient InboxPollError so the caller logs a clean
+                # one-liner (not a full socket traceback every 5 min).
                 raise InboxPollError(
-                    f"IMAP cannot select folder '{self.imap_folder}' (response={typ})"
-                )
-            # Target replies to our digest by the In-Reply-To header. The
-            # digest Message-ID is stamped as "<hi-<replyid>-...@domain>"
-            # so any reply in the same thread carries it in In-Reply-To.
-            # (Subject search was tried first but Gmail tokenises SUBJECT
-            # at indexing time and won't substring-match "[obs-".)
-            self.logger.debug("IMAP: searching UNSEEN HEADER In-Reply-To hi-")
-            typ, data = conn.search(
-                None, "UNSEEN", "HEADER", "In-Reply-To", '"hi-"'
-            )
-            if typ != "OK" or not data or not data[0]:
-                # Fallback: subject tag match for non-Gmail servers or
-                # clients that strip threading headers.
-                self.logger.debug(
-                    'IMAP: no In-Reply-To match; trying SUBJECT "[obs-"'
-                )
-                typ, data = conn.search(None, "UNSEEN", "SUBJECT", '"[obs-"')
-            if typ != "OK" or not data or not data[0]:
-                self.logger.debug("IMAP: no matching unseen messages")
-                return 0
-            uids = data[0].split()
-            if len(uids) > MAX_MESSAGES_PER_POLL:
-                self.logger.warning(
-                    f"IMAP: {len(uids)} matching messages exceeds cap "
-                    f"{MAX_MESSAGES_PER_POLL}; processing the newest {MAX_MESSAGES_PER_POLL}"
-                )
-                uids = uids[-MAX_MESSAGES_PER_POLL:]
-            self.logger.info(f"IMAP: {len(uids)} digest reply candidate(s) to examine")
-            for uid in uids:
-                try:
-                    if self._process_message(conn, uid):
-                        count += 1
-                except Exception as exc:
-                    self.logger.exception(f"Processing IMAP message {uid!r} failed: {exc}")
+                    f"IMAP operation failed: {type(exc).__name__}: {exc}"
+                ) from exc
         finally:
             try:
                 conn.logout()
