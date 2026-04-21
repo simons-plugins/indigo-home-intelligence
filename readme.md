@@ -40,6 +40,21 @@ Plugin prefs (via **Plugins → Home Intelligence → Configure…**):
 
 See [`CLAUDE.md`](./CLAUDE.md) for the full architecture and ADR references.
 
+## Tests
+
+A Tier-A pytest suite covers the pure helpers (JSON parsing, schema
+validation, reply-id extraction, intent classification, subject tagging,
+response parsers). Tests live in `tests/` at repo root and stub the
+`indigo` module via `tests/conftest.py` so they can run outside an
+Indigo server.
+
+```bash
+pip install pytest
+python -m pytest tests/ -v
+```
+
+CI runs the suite on every PR via `.github/workflows/test.yml`.
+
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).
