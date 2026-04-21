@@ -6,12 +6,17 @@ from inbox import InboxPoller
 
 
 def _msg(**headers) -> email.message.Message:
-    """Build a minimal email.Message from header keyword args."""
+    """Build a minimal email.Message from header keyword args.
+
+    Keyword-name conventions:
+    - Internal underscores become dashes (`in_reply_to` → `In-Reply-To`).
+    - A TRAILING underscore is stripped first — used to escape Python
+      keywords (`from_` → `From`).
+    """
     msg = email.message.Message()
     for k, v in headers.items():
-        # Swap underscores for dashes so keyword args map to valid header
-        # names (e.g. in_reply_to → In-Reply-To).
-        msg[k.replace("_", "-")] = v
+        header_name = k[:-1] if k.endswith("_") else k
+        msg[header_name.replace("_", "-")] = v
     return msg
 
 

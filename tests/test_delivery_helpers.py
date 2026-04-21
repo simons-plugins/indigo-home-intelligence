@@ -26,4 +26,6 @@ class TestSubjectWithTag:
         # duplicate-looking tags that a human reader could distinguish.
         subject_with_old_tag = "Weekly digest [obs-old123]"
         result = DeliveryClient._subject_with_tag(subject_with_old_tag, "new456")
-        assert "[obs-new456]" in result
+        # Pin the exact append behaviour so a broken impl that dropped
+        # the original subject would fail loudly.
+        assert result == "Weekly digest [obs-old123] [obs-new456]"

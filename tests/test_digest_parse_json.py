@@ -32,6 +32,10 @@ class TestParseJson:
         assert result == {"observation": {"headline": "ping"}}
 
     def test_nested_objects_depth_scan_doesnt_close_early(self):
+        # Trailing text forces the depth-scan fallback: the initial
+        # json.loads fails, find-first-'{' returns the whole payload,
+        # then the depth counter must navigate the nested structure
+        # without closing early on any inner '}'.
         payload = """{
             "subject": "Weekly",
             "observation": {
@@ -41,9 +45,19 @@ class TestParseJson:
                     "when": {"device_id": 1, "state": "onState", "equals": true}
                 }
             }
-        }"""
+        }
+
+        Let me know if you need anything else."""
         result = DigestRunner._parse_json(payload)
         assert result["observation"]["proposed_rule"]["when"]["device_id"] == 1
+
+    def test_json_with_escaped_braces_in_strings_via_fallback(self):
+        # Same as test_json_with_escaped_braces_in_strings but with
+        # trailing junk so we actually exercise the depth-scan path
+        # (not just json.loads on already-valid input).
+        payload = '{"x": "contains } brace"}\n\nSome trailing commentary.'
+        result = DigestRunner._parse_json(payload)
+        assert result == {"x": "contains } brace"}
 
     def test_malformed_json_returns_none(self):
         # Unclosed string inside an otherwise-braced block

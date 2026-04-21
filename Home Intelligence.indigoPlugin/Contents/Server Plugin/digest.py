@@ -363,11 +363,27 @@ class DigestRunner:
         try:
             return json.loads(cleaned)
         except json.JSONDecodeError:
-            # One more attempt: trim trailing junk after the last balanced '}'.
+            # Trim trailing junk after the last balanced '}'. The depth
+            # counter must ignore braces that appear inside string
+            # literals — otherwise a `}` inside a rule description
+            # closes the scan early and we strip valid content.
             depth = 0
             end = -1
+            in_string = False
+            escape = False
             for i, ch in enumerate(cleaned):
-                if ch == "{":
+                if escape:
+                    escape = False
+                    continue
+                if in_string:
+                    if ch == "\\":
+                        escape = True
+                    elif ch == "\"":
+                        in_string = False
+                    continue
+                if ch == "\"":
+                    in_string = True
+                elif ch == "{":
                     depth += 1
                 elif ch == "}":
                     depth -= 1

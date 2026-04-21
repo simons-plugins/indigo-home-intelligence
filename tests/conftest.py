@@ -16,24 +16,50 @@ hitting a mocked value.
 
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock
+from types import ModuleType
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _PLUGIN_SRC = _REPO_ROOT / "Home Intelligence.indigoPlugin" / "Contents" / "Server Plugin"
 
-# Stub indigo. Most attributes are MagicMock'd (any attribute access returns
-# a mock), but PluginBase must be a real class because plugin.py subclasses
-# it at module-import time (`class Plugin(indigo.PluginBase)`). Subclassing
-# a MagicMock instance raises TypeError.
+
+class _StrictIndigoStub(ModuleType):
+    """A stand-in for the `indigo` module that raises on any attribute
+    access outside the explicit allowlist. The Tier-A test suite covers
+    pure helpers only — no Indigo surface should be reachable. A lax
+    MagicMock would make an accidental `indigo.devices[...]` reach pass
+    silently, which defeats the point. This class fails loudly instead.
+    """
+
+    _ALLOWED = ("PluginBase", "Dict")
+
+    def __getattr__(self, name):
+        if name in type(self)._ALLOWED:
+            return super().__getattribute__(name)
+        raise AttributeError(
+            f"Tier-A tests must not access indigo.{name}. "
+            f"If the helper genuinely needs it, it isn't pure — move it "
+            f"or add {name} to _StrictIndigoStub._ALLOWED."
+        )
+
+
 if "indigo" not in sys.modules:
-    indigo_stub = MagicMock()
-    indigo_stub.PluginBase = type(
-        "PluginBase",
-        (),
-        {"__init__": lambda self, *a, **kw: None},
-    )
-    sys.modules["indigo"] = indigo_stub
+    stub = _StrictIndigoStub("indigo")
+
+    # PluginBase must be a real class — plugin.py subclasses it at
+    # import time (`class Plugin(indigo.PluginBase)`).
+    class _PluginBase:
+        def __init__(self, *args, **kwargs):
+            pass
+
+    stub.PluginBase = _PluginBase
+
+    # indigo.Dict is used in places like Actions.xml body parsing.
+    # A plain dict subclass is behaviour-equivalent for the tests
+    # that never run handle_feedback directly.
+    stub.Dict = dict
+
+    sys.modules["indigo"] = stub
 
 if str(_PLUGIN_SRC) not in sys.path:
     sys.path.insert(0, str(_PLUGIN_SRC))
