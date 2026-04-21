@@ -22,10 +22,9 @@
            - An Indigo Action Group step ("Execute Plugin Action")
            - A Python script: plugin.executeAction("runDigest")
            - IWS HTTP:  POST /message/com.simons-plugins.home-intelligence/runDigest
-         uiPath="hidden" keeps it out of the user-facing action menus;
-         digests are an internal/automated concern, not a per-device
-         action users should be adding ad-hoc. -->
-    <Action id="runDigest" uiPath="hidden">
+         Shown in the action picker so users can wrap it in an Action
+         Group for scheduling / automation triggers. -->
+    <Action id="runDigest">
         <Name>Run Digest</Name>
         <CallbackMethod>handle_run_digest</CallbackMethod>
     </Action>
