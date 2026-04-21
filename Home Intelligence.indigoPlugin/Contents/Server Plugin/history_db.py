@@ -43,8 +43,32 @@ class HistoryDB:
             "database": pg_database or "indigo_history",
         }
 
+    # Recognisable fragments of psql stderr mapped to an actionable
+    # one-liner. Matched on lowercased stderr; the first hit wins so
+    # order the most-specific patterns first.
+    _PG_ERROR_HINTS = (
+        ("does not exist", "role (user) not found in Postgres — check 'Postgres user' field in Plugin Configure (case-sensitive)"),
+        ("password authentication failed", "wrong password — check 'Postgres password' in Plugin Configure"),
+        ("connection refused", "Postgres isn't accepting connections on this host/port — is Postgres.app running?"),
+        ("could not translate host name", "hostname didn't resolve — check 'Postgres host' in Plugin Configure"),
+        ("database \"", "database doesn't exist — check 'Postgres database' in Plugin Configure"),
+    )
+
+    def _diagnose_pg_error(self, stderr: str) -> str:
+        """Extract an actionable hint from psql stderr. Falls back to the
+        raw stderr on no match so we never swallow useful diagnostics —
+        the hint augments, doesn't replace."""
+        lower = stderr.lower()
+        for needle, hint in self._PG_ERROR_HINTS:
+            if needle in lower:
+                return hint
+        return "unrecognised Postgres error (see raw stderr above)"
+
     def test_connection(self):
-        """Test that we can connect and read the database."""
+        """Test that we can connect and read the database.
+
+        Logs at ``error`` on failure with a classified hint, so the user
+        sees *what* to fix rather than just the raw psql stderr."""
         try:
             if self.db_type == "sqlite":
                 conn = sqlite3.connect(self.sqlite_path)
@@ -57,7 +81,14 @@ class HistoryDB:
                     raise Exception("PostgreSQL query returned no results")
             return True
         except Exception as e:
-            self.logger.error(f"Database connection test failed: {e}")
+            msg = str(e)
+            if self.db_type == "postgresql":
+                hint = self._diagnose_pg_error(msg)
+                self.logger.error(
+                    f"SQL Logger connection test failed: {hint}. Raw: {msg}"
+                )
+            else:
+                self.logger.error(f"SQL Logger connection test failed: {msg}")
             return False
 
     def _execute_sqlite(self, sql, params=()):
@@ -145,7 +176,14 @@ class HistoryDB:
                     device_ids.append(int(parts[1]))
             return device_ids
         except Exception as e:
-            self.logger.error(f"Error listing device tables: {e}")
+            msg = str(e)
+            if self.db_type == "postgresql":
+                hint = self._diagnose_pg_error(msg)
+                self.logger.error(
+                    f"SQL Logger list-tables failed: {hint}. Raw: {msg}"
+                )
+            else:
+                self.logger.error(f"Error listing device tables: {msg}")
             return []
 
     def get_columns(self, device_id):

@@ -470,22 +470,42 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
 
     def _init_history_db(self):
+        """Initialise the SQL Logger connection and log its status so the
+        user can see immediately whether per-device rollups will be
+        available in the digest. A failed connection is NOT fatal — the
+        digest degrades to event-log-only reasoning — but it should be
+        visible at startup, not buried inside a weekly digest run."""
         db_type = self.pluginPrefs.get("dbType", "sqlite")
         if db_type == "postgresql":
+            pg_host = self.pluginPrefs.get("pgHost", "127.0.0.1")
+            pg_user = self.pluginPrefs.get("pgUser", "postgres")
+            pg_database = self.pluginPrefs.get("pgDatabase", "indigo_history")
             self.history_db = HistoryDB(
                 db_type="postgresql",
                 logger=self.logger,
-                pg_host=self.pluginPrefs.get("pgHost", "127.0.0.1"),
+                pg_host=pg_host,
                 pg_port=self.pluginPrefs.get("pgPort", "5432"),
-                pg_user=self.pluginPrefs.get("pgUser", "postgres"),
+                pg_user=pg_user,
                 pg_password=self.pluginPrefs.get("pgPassword", ""),
-                pg_database=self.pluginPrefs.get("pgDatabase", "indigo_history"),
+                pg_database=pg_database,
             )
+            target = f"postgresql @ {pg_host}/{pg_database} (user: {pg_user!r})"
         else:
+            sqlite_path = self.pluginPrefs.get("sqlitePath", "") or None
             self.history_db = HistoryDB(
                 db_type="sqlite",
                 logger=self.logger,
-                sqlite_path=self.pluginPrefs.get("sqlitePath", "") or None,
+                sqlite_path=sqlite_path,
+            )
+            target = f"sqlite @ {sqlite_path or '(default)'}"
+
+        if self.history_db.test_connection():
+            self.logger.info(f"SQL Logger ready: {target}")
+        else:
+            self.logger.warning(
+                f"SQL Logger unavailable: {target}. Digest will run "
+                f"without per-device activity rollups. Fix in Plugin "
+                f"Configure... if you want rollups."
             )
 
     def _init_rule_store(self):

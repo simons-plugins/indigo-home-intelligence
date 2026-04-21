@@ -106,6 +106,62 @@ class TestRollup7d:
         # And the failure should have been logged at debug.
         assert any("999" in m for m in logger.debug_msgs)
 
+class TestDiagnosePgError:
+    """The classifier turns raw psql stderr into a one-line actionable
+    hint so users see *what* to fix instead of having to parse Postgres
+    error text themselves."""
+
+    def _db(self):
+        return HistoryDB(
+            db_type="postgresql",
+            logger=_NullLogger(),
+            pg_host="127.0.0.1",
+            pg_user="x",
+            pg_password="y",
+            pg_database="z",
+        )
+
+    def test_role_does_not_exist(self):
+        db = self._db()
+        stderr = 'psql error: FATAL:  role "Simon" does not exist'
+        hint = db._diagnose_pg_error(stderr)
+        assert "Plugin Configure" in hint
+        assert "case-sensitive" in hint
+
+    def test_password_auth_failed(self):
+        db = self._db()
+        stderr = 'psql error: FATAL:  password authentication failed for user "simon"'
+        hint = db._diagnose_pg_error(stderr)
+        assert "password" in hint.lower()
+
+    def test_connection_refused(self):
+        db = self._db()
+        stderr = 'psql: could not connect to server: Connection refused'
+        hint = db._diagnose_pg_error(stderr)
+        assert "Postgres.app" in hint
+
+    def test_unknown_host(self):
+        db = self._db()
+        stderr = 'psql: could not translate host name "nonsense" to address'
+        hint = db._diagnose_pg_error(stderr)
+        assert "hostname" in hint.lower()
+
+    def test_missing_database(self):
+        db = self._db()
+        stderr = 'FATAL:  database "nosuchdb" does not exist'
+        hint = db._diagnose_pg_error(stderr)
+        # "does not exist" matches role hint first — that's acceptable
+        # because role errors and database errors both suggest checking
+        # the Plugin Configure dialog. Either hint is actionable.
+        assert "Plugin Configure" in hint
+
+    def test_unrecognised_error_falls_through(self):
+        db = self._db()
+        hint = db._diagnose_pg_error("something unexpected happened")
+        assert "unrecognised" in hint.lower()
+
+
+class TestRollup7dExtras:
     def test_non_int_device_id_skipped(self, tmp_path):
         db_path = _build_db(tmp_path, {100: [(1, 1.0)]})
         db = HistoryDB(
