@@ -1,0 +1,10 @@
+[project]
+name = "indigo-home-intelligence"
+version = "0.1.0"
+description = "Tests for the Home Intelligence Indigo plugin"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
