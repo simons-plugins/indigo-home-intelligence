@@ -167,6 +167,7 @@ class DigestRunner:
             prior_observations = self.observation_store.recent_for_prompt()
             events = self.event_log.read_window(days_back=window_days)
             event_summary = self.event_log.summarise(events)
+            event_summary["sql_logger_rollups"] = self._sql_rollups()
         except Exception as exc:
             self.logger.exception(f"Digest context gathering failed: {exc}")
             return None
@@ -249,31 +250,72 @@ class DigestRunner:
         events: List[dict],
         event_summary: dict,
     ) -> str:
-        local_now = now.astimezone()
-        # Event timeline: each entry on one line for token efficiency.
-        # Lines are already chronologically sorted.
-        timeline_lines = [
-            f"{e['timestamp']} | {e['source']} | {e['message']}" for e in events
-        ]
-        timeline_block = "\n".join(timeline_lines) if timeline_lines else "(empty)"
+        """Build the volatile user-message block for the digest call.
 
-        summary_block = (
-            f"Total narrated events: {event_summary.get('total_events', 0)}\n"
-            f"Top sources: {json.dumps(event_summary.get('top_sources', {}))}\n"
-            f"Events by hour: {json.dumps(event_summary.get('events_by_hour', {}))}"
-        )
+        The event log is rendered as two fenced code blocks so Claude can
+        parse them deterministically:
+
+        - ``event_log_summary`` — a single JSON object containing
+          aggregate counts plus ``sql_logger_rollups`` (per-device 7-day
+          activity counts from SQL Logger).
+        - ``event_log_timeline`` — JSON-lines (one object per line), so
+          multi-line error tracebacks in a single event's ``message``
+          survive without being broken by whatever delimiter the prompt
+          uses."""
+        local_now = now.astimezone()
+        summary_block = json.dumps(event_summary, indent=2)
+        timeline_lines = [json.dumps(e) for e in events]
+        timeline_block = "\n".join(timeline_lines)
 
         return (
             f"Current local time: {local_now.isoformat(timespec='minutes')}\n"
             f"Digest window: last {window_days} days "
             f"({since.date().isoformat()} to {now.date().isoformat()})\n\n"
-            "EVENT LOG SUMMARY\n"
-            f"{summary_block}\n\n"
-            "EVENT LOG TIMELINE (chronological)\n"
-            f"{timeline_block}\n\n"
+            "EVENT LOG SUMMARY (JSON — totals, top sources, hourly "
+            "distribution, and per-device 7-day SQL Logger rollups)\n"
+            "```event_log_summary\n"
+            f"{summary_block}\n"
+            "```\n\n"
+            "EVENT LOG TIMELINE (JSON-lines, chronological — one event "
+            "per line, full message field preserved including multi-line "
+            "tracebacks)\n"
+            "```event_log_timeline\n"
+            f"{timeline_block}\n"
+            "```\n\n"
             "Produce this week's digest as a single JSON object matching the schema. "
             "Return JSON only."
         )
+
+    # Hard cap on devices queried for SQL rollup. Saves a minute-long run
+    # on huge houses where PG psql startup dominates. 300 covers every
+    # device I've seen in practice.
+    _SQL_ROLLUP_DEVICE_CAP = 300
+
+    def _sql_rollups(self) -> dict:
+        """Return per-device 7-day activity counts from SQL Logger, keyed
+        by device_id as a string (JSON keys are always strings — avoids
+        int-vs-string drift when this rides through the prompt).
+
+        Returns an empty dict if the history DB isn't configured or if
+        the query fails — rollups are a nice-to-have, not load-bearing
+        for the digest."""
+        if self.history_db is None:
+            return {}
+        try:
+            device_ids = self.history_db.get_device_tables()
+        except Exception as exc:
+            self.logger.warning(f"SQL Logger device-table lookup failed: {exc}")
+            return {}
+        if not device_ids:
+            return {}
+        try:
+            rollups = self.history_db.rollup_7d(
+                device_ids[: self._SQL_ROLLUP_DEVICE_CAP]
+            )
+        except Exception as exc:
+            self.logger.warning(f"SQL Logger rollup failed: {exc}")
+            return {}
+        return {str(did): body for did, body in rollups.items()}
 
     def _build_house_model(self) -> dict:
         devices = []

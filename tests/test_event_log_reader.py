@@ -3,6 +3,7 @@ helpers. The live-log and file-read paths touch Indigo / filesystem and
 are covered by manual smoke tests on jarvis."""
 
 import textwrap
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from event_log_reader import EventLogReader
@@ -65,11 +66,27 @@ class TestIsUseful:
             is True
         )
 
-    def test_trailing_on_off_without_quotes_still_useful(self):
-        # Form we see in the log: 'Online Dining TRV' on
+    def test_trailing_on_off_single_quotes_is_useful(self):
+        # Several plugins (online sensors, Shelly) narrate device state
+        # changes with single quotes: "'Online Dining TRV' on".
+        # The filter accepts either quote style.
         assert (
             EventLogReader._is_useful("Online Sensor", "'Online Dining TRV' on")
-            is False  # single-quote form isn't recognised by the 'sent "'/... heuristic
+            is True
+        )
+
+    def test_sent_single_quote_narration_is_useful(self):
+        assert (
+            EventLogReader._is_useful("ShellyNGMQTT", "sent 'Study Lamp' off")
+            is True
+        )
+
+    def test_no_quotes_at_all_is_not_useful(self):
+        # Without any quoted device name we can't be sure this narrates
+        # a device — reject.
+        assert (
+            EventLogReader._is_useful("Random Plugin", "something happened")
+            is False
         )
 
     def test_unrelated_info_line(self):
@@ -264,3 +281,118 @@ class TestSummarise:
         assert summary["total_events"] == 0
         assert summary["top_sources"] == {}
         assert summary["events_by_hour"] == {}
+
+
+class TestCanonicalTs:
+    """Timestamp normalisation — live-log and file-log entries must
+    produce the same canonical display string, so the dedup key
+    `(timestamp, source, msg[:100])` collapses identical events across
+    the two data sources."""
+
+    def test_none_returns_none(self):
+        assert EventLogReader._canonical_ts(None) is None
+
+    def test_empty_string_returns_none(self):
+        assert EventLogReader._canonical_ts("") is None
+
+    def test_unparseable_string_returns_none(self):
+        assert EventLogReader._canonical_ts("not a timestamp") is None
+
+    def test_file_format_string_round_trips(self):
+        result = EventLogReader._canonical_ts("2026-04-21 15:30:12.345")
+        assert result is not None
+        display, dt = result
+        assert display == "2026-04-21 15:30:12.345"
+        assert dt == datetime(2026, 4, 21, 15, 30, 12, 345000)
+
+    def test_tz_aware_datetime_normalises_to_local(self):
+        # Live log returns tz-aware datetime. Convert to local, drop tz,
+        # and emit file-format string.
+        tz_plus_one = timezone(timedelta(hours=1))
+        ts = datetime(2026, 4, 21, 15, 30, 12, 345000, tzinfo=tz_plus_one)
+        result = EventLogReader._canonical_ts(ts)
+        assert result is not None
+        display, dt = result
+        # Display format matches the file native form — space separator,
+        # millisecond precision, no tz suffix.
+        assert display.startswith("2026-04-21 ")
+        assert display.endswith(".345")
+        # dt is naive (no tz) for cutoff comparison against datetime.now()
+        assert dt.tzinfo is None
+
+    def test_iso_string_also_normalises(self):
+        result = EventLogReader._canonical_ts("2026-04-21T15:30:12.345000+00:00")
+        assert result is not None
+        display, dt = result
+        # Display always uses space separator regardless of input format.
+        assert " " in display
+        assert "T" not in display
+
+    def test_naive_datetime_kept_naive(self):
+        # Some Indigo contexts return naive datetimes (no tzinfo).
+        # Accept as-is rather than assume a timezone.
+        ts = datetime(2026, 4, 21, 15, 30, 12, 345000)
+        result = EventLogReader._canonical_ts(ts)
+        assert result is not None
+        display, dt = result
+        assert display == "2026-04-21 15:30:12.345"
+        assert dt == ts
+
+
+class TestReadHistoricalCutoff:
+    """_read_historical must apply a rolling cutoff so the oldest file
+    isn't included whole when the window boundary sits mid-day. The
+    method itself is read-only filesystem glue; we exercise it here by
+    writing a date-stamped file matching the expected naming and
+    checking which events survive the cutoff filter."""
+
+    def _write_day_file(self, tmp_path: Path, date_str: str, lines):
+        logs_dir = tmp_path / "Logs"
+        logs_dir.mkdir(exist_ok=True)
+        path = logs_dir / f"{date_str} Events.txt"
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return path
+
+    def test_events_before_rolling_cutoff_are_dropped(self, tmp_path, monkeypatch):
+        # Fix "now" so the test is deterministic.
+        fixed_now = datetime(2026, 4, 21, 14, 0, 0)
+
+        class _FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is None:
+                    return fixed_now
+                return fixed_now.replace(tzinfo=tz)
+
+        monkeypatch.setattr(
+            "event_log_reader.datetime", _FixedDatetime
+        )
+        # Yesterday's file: 3 events spread across the day. With
+        # days_back=1 and fixed_now=14:00, anything before 14:00 on
+        # yesterday should be dropped.
+        yesterday = fixed_now.date() - timedelta(days=1)
+        self._write_day_file(
+            tmp_path,
+            yesterday.strftime("%Y-%m-%d"),
+            [
+                f"{yesterday.strftime('%Y-%m-%d')} 09:00:00.000\tTrigger\tToo old",
+                f"{yesterday.strftime('%Y-%m-%d')} 13:59:59.000\tTrigger\tAlso too old",
+                f"{yesterday.strftime('%Y-%m-%d')} 15:00:00.000\tTrigger\tInside window",
+            ],
+        )
+        reader = EventLogReader(
+            logger=_NullLogger(), install_folder=str(tmp_path)
+        )
+        events = reader._read_historical(days_back=1)
+        messages = [e["message"] for e in events]
+        assert "Inside window" in messages
+        assert "Too old" not in messages
+        assert "Also too old" not in messages
+
+    def test_missing_install_folder_returns_empty(self, tmp_path):
+        # No Logs/ directory — read returns [], no crash.
+        reader = EventLogReader(
+            logger=_NullLogger(), install_folder=str(tmp_path / "nonexistent")
+        )
+        events = reader._read_historical(days_back=7)
+        assert events == []

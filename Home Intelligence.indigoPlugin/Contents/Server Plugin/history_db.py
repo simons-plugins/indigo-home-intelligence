@@ -314,6 +314,48 @@ class HistoryDB:
             points.append({"t": epoch, "v": value})
         return points
 
+    def rollup_7d(self, device_ids):
+        """Per-device activity rollup over the past 7 days.
+
+        Returns a dict ``{device_id: {"changes_7d": int}}`` for every
+        device whose history table exists and has at least one row in
+        the window. Devices with zero rows are omitted to keep the
+        digest prompt small. Devices whose table is missing or whose
+        query errors are skipped (logged at debug).
+
+        Caller is expected to pass a pre-filtered ID list (typically
+        the output of ``get_device_tables()``) so we don't probe for
+        tables that don't exist. SQL Logger stores ``ts`` in UTC, so
+        the cutoff is computed in UTC."""
+        if not device_ids:
+            return {}
+        start = datetime.now(timezone.utc) - timedelta(days=7)
+        start_ts = start.strftime("%Y-%m-%d %H:%M:%S")
+        out = {}
+        for did in device_ids:
+            if not isinstance(did, int):
+                continue
+            table = f"device_history_{did}"
+            try:
+                if self.db_type == "sqlite":
+                    sql = f'SELECT COUNT(*) FROM "{table}" WHERE ts >= ?'
+                else:
+                    sql = f'SELECT COUNT(*) FROM "{table}" WHERE ts >= %s'
+                _, rows = self._execute(sql, (start_ts,))
+                if not rows:
+                    continue
+                raw_count = rows[0][0]
+                if raw_count in (None, ""):
+                    continue
+                count = int(raw_count)
+                if count > 0:
+                    out[did] = {"changes_7d": count}
+            except Exception as exc:
+                self.logger.debug(
+                    f"rollup_7d for device {did} failed: {exc}"
+                )
+        return out
+
     def close(self):
         """No persistent connections to close (SQLite opens per-query, PG uses psql CLI)."""
         pass

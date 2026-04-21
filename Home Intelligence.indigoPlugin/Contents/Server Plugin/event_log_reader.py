@@ -34,7 +34,7 @@ import os
 import re
 from collections import Counter
 from datetime import datetime, timedelta
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import indigo
 
@@ -151,21 +151,19 @@ class EventLogReader:
             self.logger.exception(f"Failed to read live event log: {exc}")
             return []
 
-        cutoff = datetime.now().astimezone() - timedelta(days=days_back)
+        cutoff = datetime.now() - timedelta(days=days_back)
         events: List[dict] = []
         for entry in raw:
             d = dict(entry)
-            ts = d.get("TimeStamp")
-            ts_iso = self._to_iso(ts)
-            if ts_iso is None:
+            canonical = self._canonical_ts(d.get("TimeStamp"))
+            if canonical is None:
                 continue
-            # Cheap cutoff via lexicographic compare on the normalised ISO
-            # timestamp — isoformat() sorts correctly.
-            if ts_iso < cutoff.isoformat():
+            display, dt_local = canonical
+            if dt_local < cutoff:
                 continue
             events.append(
                 {
-                    "timestamp": ts_iso,
+                    "timestamp": display,
                     "source": d.get("TypeStr", ""),
                     "message": d.get("Message", ""),
                 }
@@ -173,18 +171,37 @@ class EventLogReader:
         return events
 
     @staticmethod
-    def _to_iso(ts) -> Optional[str]:
-        """Coerce whatever ``getEventLogList`` returns for TimeStamp into
-        an ISO string. In practice it's a tz-aware datetime, but defend
-        against strings and other shapes just in case."""
+    def _canonical_ts(ts) -> Optional[Tuple[str, datetime]]:
+        """Normalise any incoming timestamp into a (display_string,
+        naive_local_datetime) pair. Display string format matches the
+        file-log native form (``YYYY-MM-DD HH:MM:SS.fff``) regardless
+        of source, so the same event appearing in both the live log
+        (tz-aware datetime) and an archived file collapses to one
+        dedup key. Returns None for any unparseable input."""
         if ts is None:
             return None
-        if hasattr(ts, "isoformat"):
+        if hasattr(ts, "astimezone"):
             try:
-                return ts.isoformat()
+                local = ts.astimezone() if ts.tzinfo else ts
+                naive = local.replace(tzinfo=None)
             except Exception:
                 return None
-        return str(ts)
+        else:
+            s = str(ts).strip()
+            if not s:
+                return None
+            try:
+                naive = datetime.strptime(s, "%Y-%m-%d %H:%M:%S.%f")
+            except ValueError:
+                try:
+                    dt = datetime.fromisoformat(s)
+                except ValueError:
+                    return None
+                local = dt.astimezone() if dt.tzinfo else dt
+                naive = local.replace(tzinfo=None)
+        ms = naive.microsecond // 1000
+        display = f"{naive.strftime('%Y-%m-%d %H:%M:%S')}.{ms:03d}"
+        return display, naive
 
     # ------------------------------------------------------------------
     # Historical files
@@ -199,10 +216,15 @@ class EventLogReader:
             self.logger.warning(f"Event log directory not found: {logs_dir}")
             return []
 
-        today = datetime.now().astimezone().date()
+        now_local = datetime.now()
+        cutoff = now_local - timedelta(days=days_back)
+        today = now_local.date()
         events: List[dict] = []
         # range(1, days_back + 1) = yesterday, day-before, … — today is
-        # already covered by the live log.
+        # already covered by the live log. Apply a rolling cutoff per
+        # event so the oldest file isn't included whole when days_back
+        # crosses mid-day (e.g. running at 14:00 with days_back=7 should
+        # stop 7 days ago at 14:00, not at midnight).
         for i in range(1, days_back + 1):
             date = today - timedelta(days=i)
             filename = os.path.join(
@@ -210,7 +232,15 @@ class EventLogReader:
             )
             if not os.path.isfile(filename):
                 continue
-            events.extend(self._parse_file(filename))
+            for e in self._parse_file(filename):
+                canonical = self._canonical_ts(e.get("timestamp"))
+                if canonical is None:
+                    continue
+                display, dt_local = canonical
+                if dt_local < cutoff:
+                    continue
+                e["timestamp"] = display
+                events.append(e)
         return events
 
     def _get_install_folder(self) -> Optional[str]:
@@ -298,13 +328,17 @@ class EventLogReader:
         if src in _USEFUL_TYPE_STR:
             return True
         # Device state-change narrations from plugin sources (Z-Wave,
-        # ShellyNGMQTT, Hue, etc.). Heuristic: the message mentions a
-        # device in quotes and the verb describes a state change.
-        if '"' not in msg:
+        # ShellyNGMQTT, Hue, online sensors etc.). Heuristic: the
+        # message mentions a device in quotes (double OR single — the
+        # online-sensor plugins use single quotes: "'Online Dining
+        # TRV' on") and the verb describes a state change.
+        if '"' not in msg and "'" not in msg:
             return False
         narrated = (
-            "sent \"" in msg
-            or "received \"" in msg
+            'sent "' in msg
+            or "sent '" in msg
+            or 'received "' in msg
+            or "received '" in msg
             or "set to" in msg
             or msg.endswith(" on")
             or msg.endswith(" off")
