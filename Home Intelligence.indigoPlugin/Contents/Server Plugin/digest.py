@@ -239,9 +239,15 @@ class DigestRunner:
                 }
             )
 
-        triggers = [self._trigger_snapshot(t) for t in indigo.triggers]
-        schedules = [self._schedule_snapshot(s) for s in indigo.schedules]
-        action_groups = [self._action_group_snapshot(a) for a in indigo.actionGroups]
+        triggers = self._snapshot_all(
+            indigo.triggers, self._trigger_snapshot, "trigger"
+        )
+        schedules = self._snapshot_all(
+            indigo.schedules, self._schedule_snapshot, "schedule"
+        )
+        action_groups = self._snapshot_all(
+            indigo.actionGroups, self._action_group_snapshot, "action_group"
+        )
         folders = [
             {"id": f.id, "name": f.name} for f in indigo.devices.folders
         ]
@@ -267,73 +273,121 @@ class DigestRunner:
         return dev.__class__.__name__
 
     # ------------------------------------------------------------------
-    # Automation snapshots (issue #2)
+    # Automation snapshots
     #
-    # Early versions of the digest only surfaced name + id + enabled for
-    # schedules / triggers / action groups. Claude couldn't tell that
-    # "Coffee Off 4pm" actually targeted the coffee machine and proposed
-    # a duplicate auto-off rule. These snapshots use dict(obj) coercion
-    # (Indigo supports it on Schedule, Trigger, and ActionGroup — same
-    # pattern used in indigomcp's data adapter) to expose the full
-    # configuration, then filter to the fields worth spending tokens on.
+    # Indigo schedules, triggers, and action groups support dict()
+    # coercion (same pattern as indigomcp's data adapter). We use that
+    # to expose the configuration body — name + id + enabled alone
+    # doesn't tell a reasoning model what a schedule or trigger
+    # actually does.
+    #
+    # dict() coercion can be partial (a class may not expose every
+    # field through the mapping protocol), so each snapshot also has a
+    # named-attribute fallback for the fields we care about.
     # ------------------------------------------------------------------
 
-    # Fields we intentionally drop per object — pure noise for the LLM:
-    # xml-internal markers, deprecated aliases, timestamps the model
-    # can't reason over, empty strings we'd emit as "".
-    _DROP_SCHEDULE_KEYS = frozenset(
+    # Noise keys from dict(obj): XML-serialisation internals plus
+    # boolean aliases (`configured`, `remoteDisplay`) that duplicate
+    # .enabled semantics. One shared set across schedule / trigger /
+    # action_group — keys that don't exist on a given object are
+    # harmlessly no-op.
+    _DROP_NOISE_KEYS = frozenset(
         {"configured", "remoteDisplay", "xmlElement", "xml", "class"}
-    )
-    _DROP_TRIGGER_KEYS = frozenset(
-        {"configured", "remoteDisplay", "xmlElement", "xml", "class"}
-    )
-    _DROP_ACTION_GROUP_KEYS = frozenset(
-        {"remoteDisplay", "xmlElement", "xml", "class"}
     )
 
+    # Fields we hand-compute on the snapshot before merging dict() output.
+    # We strip these from the merge so Indigo's raw bytes can't clobber our
+    # canonical values (most importantly `type`, which we set to the Python
+    # class name so Claude can distinguish DeviceStateChangeTrigger from
+    # PluginEventTrigger).
+    _RESERVED_SNAPSHOT_KEYS = frozenset({"id", "name", "enabled", "type"})
+
+    # Candidate attribute names for schedule fire-time. Indigo docs don't
+    # nail down the exact spelling and it may vary by schedule subtype;
+    # we probe each in order and keep the first non-empty value.
+    _SCHEDULE_TIME_CANDIDATES = (
+        "scheduleTime",
+        "time",
+        "nextExecution",
+        "nextDate",
+        "nextScheduled",
+    )
+
+    def _snapshot_all(self, iterable, snapshot_fn, label: str) -> List[dict]:
+        """Iterate an `indigo.*` collection and build snapshots with
+        per-object isolation: one broken object degrades to a stub and
+        a warning, the rest keep full fidelity. Returns the list in
+        original order."""
+        out = []
+        for obj in iterable:
+            try:
+                out.append(snapshot_fn(obj, logger=self.logger))
+            except (MemoryError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                obj_id = getattr(obj, "id", "?")
+                obj_name = getattr(obj, "name", "?")
+                self.logger.warning(
+                    f"Skipping {label} id={obj_id} name={obj_name!r} "
+                    f"in house model snapshot: {exc}"
+                )
+                out.append(
+                    {"id": obj_id, "name": obj_name, "_snapshot_error": str(exc)}
+                )
+        return out
+
     @classmethod
-    def _schedule_snapshot(cls, schedule) -> dict:
+    def _schedule_snapshot(cls, schedule, logger=None) -> dict:
         """Serialise an Indigo schedule so Claude can see when it fires
         and what it does. Prefers dict() coercion; falls back to named
-        attributes if coercion is partial on older Indigo versions."""
-        base = cls._safe_indigo_dict(schedule)
+        attributes when the mapping protocol returns a partial result."""
+        base = cls._safe_indigo_dict(schedule, logger=logger)
         snapshot = {
             "id": schedule.id,
             "name": schedule.name,
             "enabled": bool(schedule.enabled),
             "type": type(schedule).__name__,
         }
-        snapshot.update(cls._filter_keys(base, cls._DROP_SCHEDULE_KEYS))
-        # Explicit common fields in case dict() missed them
-        for key, attr in (
-            ("description", "description"),
-            ("folder_id", "folderId"),
-            ("next_execution", "nextExecution"),
-            ("schedule_time", "scheduleTime"),
-        ):
-            if key not in snapshot:
+        snapshot.update(cls._extras(base, cls._DROP_NOISE_KEYS))
+
+        # Fill in any of the headline fields that dict() missed.
+        if "description" not in snapshot:
+            value = getattr(schedule, "description", None)
+            if value:
+                snapshot["description"] = cls._jsonable(value)
+        if "folder_id" not in snapshot and "folderId" not in snapshot:
+            value = getattr(schedule, "folderId", None)
+            if value is not None:
+                snapshot["folder_id"] = cls._jsonable(value)
+
+        # Schedule fire-time: probe candidate attribute names and keep the
+        # first populated one under a stable `schedule_time` key.
+        if not any(k in snapshot for k in cls._SCHEDULE_TIME_CANDIDATES) and \
+                "schedule_time" not in snapshot:
+            for attr in cls._SCHEDULE_TIME_CANDIDATES:
                 value = getattr(schedule, attr, None)
                 if value not in (None, ""):
-                    snapshot[key] = cls._jsonable(value)
+                    snapshot["schedule_time"] = cls._jsonable(value)
+                    break
         return snapshot
 
     @classmethod
-    def _trigger_snapshot(cls, trigger) -> dict:
+    def _trigger_snapshot(cls, trigger, logger=None) -> dict:
         """Serialise an Indigo trigger so Claude can see the event
         condition and what fires as a result. Captures subclass-specific
-        fields via dict() coercion plus a few named fallbacks."""
-        base = cls._safe_indigo_dict(trigger)
+        fields via dict() coercion plus named fallbacks for each
+        documented subclass (DeviceStateChangeTrigger,
+        VariableValueChangeTrigger, PluginEventTrigger)."""
+        base = cls._safe_indigo_dict(trigger, logger=logger)
         snapshot = {
             "id": trigger.id,
             "name": trigger.name,
             "enabled": bool(trigger.enabled),
             "type": type(trigger).__name__,
         }
-        snapshot.update(cls._filter_keys(base, cls._DROP_TRIGGER_KEYS))
-        # Explicit subclass fields in case dict() missed them — see
-        # indigo docs: DeviceStateChangeTrigger / VariableValueChangeTrigger /
-        # PluginEventTrigger attributes.
-        for key, attr in (
+        snapshot.update(cls._extras(base, cls._DROP_NOISE_KEYS))
+
+        for snapshot_key, attr in (
             ("description", "description"),
             ("folder_id", "folderId"),
             ("device_id", "deviceId"),
@@ -344,71 +398,126 @@ class DigestRunner:
             ("plugin_id", "pluginId"),
             ("plugin_type_id", "pluginTypeId"),
         ):
-            if key not in snapshot:
-                value = getattr(trigger, attr, None)
-                if value not in (None, ""):
-                    snapshot[key] = cls._jsonable(value)
+            if snapshot_key in snapshot or attr in snapshot:
+                continue
+            value = getattr(trigger, attr, None)
+            if value not in (None, ""):
+                snapshot[snapshot_key] = cls._jsonable(value)
         return snapshot
 
     @classmethod
-    def _action_group_snapshot(cls, action_group) -> dict:
-        """Serialise an Indigo action group so Claude can see the ordered
-        list of actions it performs (target device ids, ops, values)."""
-        base = cls._safe_indigo_dict(action_group)
+    def _action_group_snapshot(cls, action_group, logger=None) -> dict:
+        """Serialise an Indigo action group. Note: Indigo's Object Model
+        doesn't expose the per-action list of target devices via the
+        Python mapping protocol, so Claude sees name + description +
+        folder and has to rely on names for cross-referencing."""
+        base = cls._safe_indigo_dict(action_group, logger=logger)
         snapshot = {
             "id": action_group.id,
             "name": action_group.name,
             "type": type(action_group).__name__,
         }
-        snapshot.update(cls._filter_keys(base, cls._DROP_ACTION_GROUP_KEYS))
-        for key, attr in (
-            ("description", "description"),
-            ("folder_id", "folderId"),
-        ):
-            if key not in snapshot:
-                value = getattr(action_group, attr, None)
-                if value not in (None, ""):
-                    snapshot[key] = cls._jsonable(value)
+        snapshot.update(cls._extras(base, cls._DROP_NOISE_KEYS))
+
+        if "description" not in snapshot:
+            value = getattr(action_group, "description", None)
+            if value:
+                snapshot["description"] = cls._jsonable(value)
+        if "folder_id" not in snapshot and "folderId" not in snapshot:
+            value = getattr(action_group, "folderId", None)
+            if value is not None:
+                snapshot["folder_id"] = cls._jsonable(value)
         return snapshot
 
-    @staticmethod
-    def _safe_indigo_dict(obj) -> dict:
-        """dict(indigo_obj) works for schedules/triggers/action_groups but
-        may blow up on unexpected attribute types. Isolate the failure
-        and return {} instead — the caller will still emit name+id."""
+    @classmethod
+    def _extras(cls, base: dict, drop: frozenset) -> dict:
+        """Filter a dict-coerced snapshot body down to keys worth merging:
+        drop noise keys + any empty-value keys, and strip reserved keys
+        that the caller set authoritatively (so dict() can't clobber
+        id/name/enabled/type with wire values)."""
+        filtered = cls._filter_keys(base, drop)
+        return {k: v for k, v in filtered.items() if k not in cls._RESERVED_SNAPSHOT_KEYS}
+
+    @classmethod
+    def _safe_indigo_dict(cls, obj, logger=None) -> dict:
+        """Coerce an Indigo object to a dict via the mapping protocol.
+        On any Exception (e.g. a property that raises during enumeration),
+        log at debug and return {} — the caller will still emit the
+        hand-set id/name/enabled fields so the object doesn't disappear
+        from the manifest."""
         try:
             raw = dict(obj)
-        except Exception:
+        except (MemoryError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            if logger is not None:
+                obj_id = getattr(obj, "id", "?")
+                logger.debug(
+                    f"dict() coercion failed on {type(obj).__name__} "
+                    f"id={obj_id}: {exc}; snapshot will use hand-set fields only"
+                )
             return {}
-        return {k: DigestRunner._jsonable(v) for k, v in raw.items()}
+        try:
+            return {k: cls._jsonable(v) for k, v in raw.items()}
+        except (MemoryError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            if logger is not None:
+                logger.debug(
+                    f"_jsonable failed mid-dict on {type(obj).__name__}: {exc}; "
+                    "snapshot will use hand-set fields only"
+                )
+            return {}
 
     @staticmethod
     def _filter_keys(d: dict, drop: frozenset) -> dict:
-        """Strip drop-listed keys and any key with a None / empty-string
-        value. Keeps the prompt from being overrun with empty noise."""
-        return {
-            k: v for k, v in d.items()
-            if k not in drop and v not in (None, "", [], {})
-        }
+        """Strip drop-listed keys plus any None / empty-string /
+        empty-list / empty-dict values. Preserves 0 and False — a
+        disabled schedule legitimately has enabled=False and we still
+        want to see it. Recurses into nested dicts and into dicts
+        appearing as list elements (Indigo pluginProps can nest
+        indigo.Dict / indigo.List arbitrarily)."""
+        out = {}
+        for k, v in d.items():
+            if k in drop:
+                continue
+            if isinstance(v, dict):
+                v = DigestRunner._filter_keys(v, drop)
+            elif isinstance(v, list):
+                v = [
+                    DigestRunner._filter_keys(item, drop)
+                    if isinstance(item, dict) else item
+                    for item in v
+                ]
+            if v in (None, "", [], {}):
+                continue
+            out[k] = v
+        return out
 
     @staticmethod
     def _jsonable(value):
         """Best-effort coerce an Indigo return value into something
-        json.dumps can serialise. Falls back to str() for exotic types
-        (datetime, indigo.Dict, indigo.List, enum values, etc.)."""
+        json.dumps can serialise. Primitives pass through; lists / tuples
+        / dicts recurse; datetime, indigo.Dict, indigo.List, enum values
+        and anything else fall through to str(). Dict keys are stringified
+        (json.dumps can't serialise non-string keys and Indigo IDs are
+        integers)."""
         if value is None or isinstance(value, (bool, int, float, str)):
             return value
-        if isinstance(value, (list, tuple)):
-            return [DigestRunner._jsonable(v) for v in value]
-        if isinstance(value, dict):
-            return {str(k): DigestRunner._jsonable(v) for k, v in value.items()}
-        # indigo.Dict / indigo.List / datetime / Enum / etc.
+        # Recursion is wrapped so one misbehaving proxy (e.g. a lazy
+        # indigo.Dict whose items() raises on iteration) falls through
+        # to str() instead of propagating out and killing the snapshot.
         try:
-            # indigo.Dict and indigo.List should be dict/list-coercible
+            if isinstance(value, (list, tuple)):
+                return [DigestRunner._jsonable(v) for v in value]
+            if isinstance(value, dict):
+                return {str(k): DigestRunner._jsonable(v) for k, v in value.items()}
             if hasattr(value, "items"):
                 return {str(k): DigestRunner._jsonable(v) for k, v in value.items()}
             if hasattr(value, "__iter__"):
                 return [DigestRunner._jsonable(v) for v in value]
+        except (MemoryError, KeyboardInterrupt, SystemExit):
+            raise
         except Exception:
             pass
         return str(value)
