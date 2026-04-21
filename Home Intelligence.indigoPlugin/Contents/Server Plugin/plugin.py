@@ -311,6 +311,23 @@ class Plugin(indigo.PluginBase):
     def handle_status(self, action, dev=None, callerWaitingForResult=None):
         return {"status": "ok", "plugin": "home-intelligence"}
 
+    def handle_run_digest(self, action, dev=None, callerWaitingForResult=None):
+        """Programmatic entrypoint for a digest run. Wraps DigestRunner.run
+        so callers outside the plugin (Action Groups, HTTP, scripts) can
+        trigger a digest without going through the menu. Returns a minimal
+        status dict rather than the full digest output — the real output
+        goes out by email."""
+        self.logger.info("Action: runDigest")
+        if not self.digest:
+            self.logger.warning("runDigest called before startup completed")
+            return {"status": "error", "detail": "digest_not_ready"}
+        try:
+            result = self.digest.run(window_days=7)
+        except Exception as exc:
+            self.logger.exception(f"runDigest failed: {exc}")
+            return {"status": "error", "detail": str(exc)}
+        return {"status": "ok", "reply_id": result}
+
     def handle_feedback(self, action, dev=None, callerWaitingForResult=None):
         """IWS HTTP entrypoint — parses the JSON body, verifies the
         X-HI-Signature HMAC, and delegates to _dispatch_feedback.
