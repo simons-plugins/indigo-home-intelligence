@@ -36,6 +36,7 @@ from typing import List, Optional
 import indigo
 
 from anthropic_client import AnthropicClient, AnthropicError
+from event_log_reader import EventLogReader
 
 
 # ---------------------------------------------------------------------
@@ -54,6 +55,27 @@ GOALS
   code, no DSL.
 - Never re-suggest something the owner has already declined or that is
   already automated by an existing trigger, schedule, or agent rule.
+
+REASONING OVER THE EVENT LOG
+You are given the last 7 days of Indigo event log narrations alongside
+the static house model. Use them to understand what ACTUALLY happens,
+not just what's configured:
+
+- Action group names like "Simon Light Off" or "Study Lights Evening"
+  don't reveal what devices they control. The log does: look for the
+  device state-change narrations ("sent 'Study Lamp' off") that appear
+  immediately after an action group fires to infer its effect.
+- "Auto Lights" narrations show the plugin's presence-based zone logic
+  — treat this as active automation even though it's not a native
+  Indigo trigger / schedule.
+- A device changing state without any nearby (within ~5 seconds)
+  trigger, schedule, or action-group narration is EITHER a manual
+  action OR a trigger with "Write to Event Log" disabled. Hedge
+  accordingly — don't confidently call it manual.
+- Prefer observations grounded in actual behaviour ("Study Lamp was
+  manually left on past 23:00 on 4 of 7 nights") over structural
+  ones ("you have a study lamp with no auto-off"). The former is
+  actionable, the latter is speculation.
 
 RULE SCHEMA (the shape `observation.proposed_rule` must match, when non-null)
   {
@@ -122,6 +144,7 @@ class DigestRunner:
         self.email_to = email_to
         self.logger = logger
         self.client = AnthropicClient(api_key=api_key, model=model, logger=logger)
+        self.event_log = EventLogReader(logger=logger)
 
     # ------------------------------------------------------------------
     # Entry point
@@ -142,17 +165,21 @@ class DigestRunner:
             house_model = self._build_house_model()
             rules = self.rule_store.list_rules()
             prior_observations = self.observation_store.recent_for_prompt()
+            events = self.event_log.read_window(days_back=window_days)
+            event_summary = self.event_log.summarise(events)
         except Exception as exc:
             self.logger.exception(f"Digest context gathering failed: {exc}")
             return None
 
         system_blocks = self._build_system_blocks(house_model, rules, prior_observations)
-        user_message = self._build_user_message(now, since, window_days)
+        user_message = self._build_user_message(
+            now, since, window_days, events, event_summary
+        )
 
         self.logger.info(
             f"Digest: calling {self.model} "
             f"(devices={len(house_model['devices'])}, rules={len(rules)}, "
-            f"prior_obs={len(prior_observations)})"
+            f"prior_obs={len(prior_observations)}, events={len(events)})"
         )
         try:
             response = self.client.create_message(
@@ -214,12 +241,36 @@ class DigestRunner:
             {"type": "text", "text": context, "cache_control": {"type": "ephemeral"}},
         ]
 
-    def _build_user_message(self, now: datetime, since: datetime, window_days: int) -> str:
+    def _build_user_message(
+        self,
+        now: datetime,
+        since: datetime,
+        window_days: int,
+        events: List[dict],
+        event_summary: dict,
+    ) -> str:
         local_now = now.astimezone()
+        # Event timeline: each entry on one line for token efficiency.
+        # Lines are already chronologically sorted.
+        timeline_lines = [
+            f"{e['timestamp']} | {e['source']} | {e['message']}" for e in events
+        ]
+        timeline_block = "\n".join(timeline_lines) if timeline_lines else "(empty)"
+
+        summary_block = (
+            f"Total narrated events: {event_summary.get('total_events', 0)}\n"
+            f"Top sources: {json.dumps(event_summary.get('top_sources', {}))}\n"
+            f"Events by hour: {json.dumps(event_summary.get('events_by_hour', {}))}"
+        )
+
         return (
             f"Current local time: {local_now.isoformat(timespec='minutes')}\n"
             f"Digest window: last {window_days} days "
             f"({since.date().isoformat()} to {now.date().isoformat()})\n\n"
+            "EVENT LOG SUMMARY\n"
+            f"{summary_block}\n\n"
+            "EVENT LOG TIMELINE (chronological)\n"
+            f"{timeline_block}\n\n"
             "Produce this week's digest as a single JSON object matching the schema. "
             "Return JSON only."
         )
