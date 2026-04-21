@@ -375,7 +375,8 @@ class TestScheduleSnapshot:
 
     def test_dict_coercion_failure_falls_back_to_getattr(self):
         """Dict() raises; hand-set fields still populate; fallback
-        getattrs recover description/folder_id/schedule_time."""
+        getattrs recover description / folderId / scheduleTime under
+        Indigo's native camelCase keys."""
         class BrokenSched:
             id = 999
             name = "Broken"
@@ -391,12 +392,13 @@ class TestScheduleSnapshot:
         assert snap["enabled"] is True
         assert snap["type"] == "BrokenSched"
         assert snap["description"] == "fallback desc"
-        assert snap["folder_id"] == 7
-        assert snap["schedule_time"] == "09:00:00"
+        assert snap["folderId"] == 7
+        assert snap["scheduleTime"] == "09:00:00"
 
     def test_schedule_time_candidate_attributes(self):
         """If `scheduleTime` doesn't exist but `nextExecution` does,
-        that's what gets exposed under `schedule_time`."""
+        the fallback emits it under its real attribute name — the
+        snapshot shape stays aligned with Indigo's camelCase."""
         class OddSchedule:
             id = 1
             name = "Odd"
@@ -406,7 +408,8 @@ class TestScheduleSnapshot:
             def keys(self):
                 return []
         snap = DigestRunner._schedule_snapshot(OddSchedule())
-        assert snap["schedule_time"] == "22:30:00"
+        assert snap["nextExecution"] == "22:30:00"
+        assert "scheduleTime" not in snap
 
     def test_hand_set_keys_not_clobbered_by_dict(self):
         """If dict() exposes `type` or `enabled`, hand-set values win —
@@ -475,7 +478,8 @@ class TestTriggerSnapshot:
 
     def test_fallback_fires_when_dict_omits_field(self):
         """If dict() doesn't include `deviceId` but the attribute
-        exists on the trigger, the named fallback must pick it up."""
+        exists on the trigger, the named fallback emits it under the
+        canonical camelCase key — no snake_case duplicate."""
         class PartialDict:
             id = 300
             name = "partial"
@@ -492,9 +496,12 @@ class TestTriggerSnapshot:
             def __getitem__(self, key):
                 return getattr(self, key)
         snap = DigestRunner._trigger_snapshot(PartialDict())
-        assert snap["device_id"] == 99999
-        assert snap["state_selector"] == "onOffState"
-        assert snap["state_value"] is True
+        assert snap["deviceId"] == 99999
+        assert snap["stateSelector"] == "onOffState"
+        assert snap["stateValue"] is True
+        # No snake_case duplicates in the snapshot.
+        assert "device_id" not in snap
+        assert "state_selector" not in snap
 
 
 class TestActionGroupSnapshot:
@@ -530,7 +537,7 @@ class TestActionGroupSnapshot:
         assert snap["id"] == 301
         assert snap["name"] == "Broken"
         assert snap["description"] == "fallback desc"
-        assert snap["folder_id"] == 3
+        assert snap["folderId"] == 3
 
 
 # ---------------------------------------------------------------------

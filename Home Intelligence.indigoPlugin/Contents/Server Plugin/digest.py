@@ -350,24 +350,26 @@ class DigestRunner:
         }
         snapshot.update(cls._extras(base, cls._DROP_NOISE_KEYS))
 
-        # Fill in any of the headline fields that dict() missed.
+        # Fill headline fields that dict() missed. Key names mirror
+        # Indigo's native camelCase so dict-path and fallback-path
+        # produce identical shapes.
         if "description" not in snapshot:
             value = getattr(schedule, "description", None)
             if value:
                 snapshot["description"] = cls._jsonable(value)
-        if "folder_id" not in snapshot and "folderId" not in snapshot:
+        if "folderId" not in snapshot:
             value = getattr(schedule, "folderId", None)
             if value is not None:
-                snapshot["folder_id"] = cls._jsonable(value)
+                snapshot["folderId"] = cls._jsonable(value)
 
-        # Schedule fire-time: probe candidate attribute names and keep the
-        # first populated one under a stable `schedule_time` key.
-        if not any(k in snapshot for k in cls._SCHEDULE_TIME_CANDIDATES) and \
-                "schedule_time" not in snapshot:
+        # Schedule fire-time: probe candidate attribute names and
+        # expose the first populated one under its real attribute name
+        # (scheduleTime / nextExecution / etc.), not a renamed slot.
+        if not any(k in snapshot for k in cls._SCHEDULE_TIME_CANDIDATES):
             for attr in cls._SCHEDULE_TIME_CANDIDATES:
                 value = getattr(schedule, attr, None)
                 if value not in (None, ""):
-                    snapshot["schedule_time"] = cls._jsonable(value)
+                    snapshot[attr] = cls._jsonable(value)
                     break
         return snapshot
 
@@ -387,22 +389,25 @@ class DigestRunner:
         }
         snapshot.update(cls._extras(base, cls._DROP_NOISE_KEYS))
 
-        for snapshot_key, attr in (
-            ("description", "description"),
-            ("folder_id", "folderId"),
-            ("device_id", "deviceId"),
-            ("state_selector", "stateSelector"),
-            ("state_value", "stateValue"),
-            ("variable_id", "variableId"),
-            ("variable_value", "variableValue"),
-            ("plugin_id", "pluginId"),
-            ("plugin_type_id", "pluginTypeId"),
+        # Subclass-specific fallbacks. Key names match Indigo's native
+        # camelCase (which is what dict() emits), so dict-path and
+        # fallback-path produce identical snapshot shapes.
+        for attr in (
+            "description",
+            "folderId",
+            "deviceId",
+            "stateSelector",
+            "stateValue",
+            "variableId",
+            "variableValue",
+            "pluginId",
+            "pluginTypeId",
         ):
-            if snapshot_key in snapshot or attr in snapshot:
+            if attr in snapshot:
                 continue
             value = getattr(trigger, attr, None)
             if value not in (None, ""):
-                snapshot[snapshot_key] = cls._jsonable(value)
+                snapshot[attr] = cls._jsonable(value)
         return snapshot
 
     @classmethod
@@ -419,14 +424,15 @@ class DigestRunner:
         }
         snapshot.update(cls._extras(base, cls._DROP_NOISE_KEYS))
 
+        # camelCase for consistency with dict() output.
         if "description" not in snapshot:
             value = getattr(action_group, "description", None)
             if value:
                 snapshot["description"] = cls._jsonable(value)
-        if "folder_id" not in snapshot and "folderId" not in snapshot:
+        if "folderId" not in snapshot:
             value = getattr(action_group, "folderId", None)
             if value is not None:
-                snapshot["folder_id"] = cls._jsonable(value)
+                snapshot["folderId"] = cls._jsonable(value)
         return snapshot
 
     @classmethod
