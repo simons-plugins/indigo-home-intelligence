@@ -530,7 +530,19 @@ class HistoryDB:
             return {}
 
         out = {}
+        malformed_rows = 0
         for row in rows:
+            # Psql's unaligned tab-separated output can occasionally
+            # return rows with fewer fields than expected when all
+            # scalar-subquery columns are NULL (the exact behaviour
+            # varies by psql version); guard rather than crash the
+            # whole rollup.
+            if len(row) < 4:
+                malformed_rows += 1
+                self.logger.debug(
+                    f"Energy rollup: skipping short row {row!r}"
+                )
+                continue
             did_raw, now_v_raw, w1_raw, w2_raw = row[0], row[1], row[2], row[3]
             try:
                 did = int(did_raw)
@@ -560,7 +572,7 @@ class HistoryDB:
             }
         self.logger.info(
             f"Energy rollup: {len(out)} device(s) have 14d history "
-            f"(from {len(valid_ids)} queried)"
+            f"(from {len(valid_ids)} queried, {malformed_rows} malformed)"
         )
         return out
 
