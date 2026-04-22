@@ -426,9 +426,15 @@ class HistoryDB:
                 _, rows = self._execute(sql)
                 table_names = [r[0] for r in rows]
             else:
+                # PostgreSQL folds unquoted identifiers to lowercase, so
+                # SQL Logger's ``accumEnergyTotal`` state becomes an
+                # ``accumenergytotal`` column. Case-sensitive string
+                # compare on column_name would return zero rows; use
+                # LOWER() to be explicit about the folding and stay
+                # robust to either-case storage.
                 sql = (
                     "SELECT table_name FROM information_schema.columns "
-                    "WHERE column_name = 'accumEnergyTotal' "
+                    "WHERE LOWER(column_name) = 'accumenergytotal' "
                     "AND table_schema = 'public' "
                     "AND table_name LIKE 'device_history_%'"
                 )
@@ -450,6 +456,10 @@ class HistoryDB:
             parts = name.split("device_history_")
             if len(parts) == 2 and parts[1].isdigit():
                 device_ids.append(int(parts[1]))
+        self.logger.info(
+            f"Energy-table discovery: {len(device_ids)} device(s) "
+            f"have accumEnergyTotal history"
+        )
         return device_ids
 
     def energy_rollup_14d(self, device_ids):
@@ -548,6 +558,10 @@ class HistoryDB:
                 "delta_kwh": delta_kwh,
                 "delta_pct": delta_pct,
             }
+        self.logger.info(
+            f"Energy rollup: {len(out)} device(s) have 14d history "
+            f"(from {len(valid_ids)} queried)"
+        )
         return out
 
     def close(self):

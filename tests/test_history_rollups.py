@@ -15,11 +15,15 @@ from history_db import HistoryDB
 class _NullLogger:
     def __init__(self):
         self.debug_msgs = []
+        self.info_msgs = []
         self.warn_msgs = []
         self.error_msgs = []
 
     def debug(self, msg, *args, **kwargs):
         self.debug_msgs.append(msg)
+
+    def info(self, msg, *args, **kwargs):
+        self.info_msgs.append(msg)
 
     def warning(self, msg, *args, **kwargs):
         self.warn_msgs.append(msg)
