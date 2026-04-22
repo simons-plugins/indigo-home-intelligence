@@ -65,12 +65,57 @@ class TestBuildUserMessage:
         summary_body = _parse_fenced_block(message, "event_log_summary")
         assert json.loads(summary_body) == summary
 
-        # Timeline is one JSON object per line — round-trips each line.
+        # Timeline is one JSON *array* per line with positional fields
+        # ["YYYY-MM-DD HH:MM:SS", source, message]. Milliseconds are
+        # sliced off for token efficiency; year is kept so windows that
+        # span New Year (e.g. late-December → early-January run) sort
+        # correctly.
         timeline_body = _parse_fenced_block(message, "event_log_timeline")
         lines = timeline_body.split("\n")
         assert len(lines) == len(events)
         for line, original in zip(lines, events):
-            assert json.loads(line) == original
+            arr = json.loads(line)
+            assert isinstance(arr, list) and len(arr) == 3
+            assert arr[0] == original["timestamp"][:19]
+            assert arr[1] == original["source"]
+            assert arr[2] == original["message"]
+
+    def test_timeline_preserves_year_across_new_year(self):
+        """Digest window can span 31 Dec / 1 Jan. Year-less timestamps
+        would sort wrongly (01-02 before 12-31). Full-year timestamps
+        are chronologically comparable."""
+        runner = _runner()
+        now = datetime(2026, 1, 4, 10, 0, tzinfo=timezone.utc)
+        since = now - timedelta(days=7)
+        events = [
+            {"timestamp": "2025-12-29 10:00:00.000", "source": "Trigger", "message": "old year"},
+            {"timestamp": "2026-01-02 10:00:00.000", "source": "Trigger", "message": "new year"},
+        ]
+        summary = {"total_events": 2, "top_sources": {}, "events_by_hour": {}, "sql_logger_rollups": {}}
+        message = runner._build_user_message(now, since, 7, events, summary)
+        timeline_body = _parse_fenced_block(message, "event_log_timeline")
+        lines = timeline_body.split("\n")
+        assert json.loads(lines[0])[0] == "2025-12-29 10:00:00"
+        assert json.loads(lines[1])[0] == "2026-01-02 10:00:00"
+
+    def test_timeline_is_compact_no_indent(self):
+        """Compact JSON (no whitespace between tokens) — avoids paying
+        for indentation in the uncached user-message block."""
+        runner = _runner()
+        now = datetime(2026, 4, 21, 14, 30, tzinfo=timezone.utc)
+        since = now - timedelta(days=7)
+        events = [
+            {"timestamp": "2026-04-21 09:00:00.000", "source": "Trigger", "message": "X"}
+        ]
+        summary = {"total_events": 1, "top_sources": {}, "events_by_hour": {}, "sql_logger_rollups": {}}
+        message = runner._build_user_message(now, since, 7, events, summary)
+        # No ", " (with space) in a valid compact-JSON array — separators
+        # should be "," only.
+        timeline_body = _parse_fenced_block(message, "event_log_timeline")
+        assert ", " not in timeline_body
+        # Summary body is also compact.
+        summary_body = _parse_fenced_block(message, "event_log_summary")
+        assert ", " not in summary_body
 
     def test_multiline_message_preserved_in_timeline(self):
         """A trigger that failed with a traceback logs a multi-line
@@ -94,11 +139,12 @@ class TestBuildUserMessage:
 
         timeline_body = _parse_fenced_block(message, "event_log_timeline")
         # Should be exactly one JSON line — the embedded newlines live
-        # inside the JSON string, not as timeline row separators.
+        # inside the JSON string at position [2] of the array, not as
+        # timeline row separators.
         assert len(timeline_body.split("\n")) == 1
-        roundtrip = json.loads(timeline_body)
-        assert "Traceback" in roundtrip["message"]
-        assert "RuntimeError: boom" in roundtrip["message"]
+        arr = json.loads(timeline_body)
+        assert "Traceback" in arr[2]
+        assert "RuntimeError: boom" in arr[2]
 
     def test_empty_events_still_emits_fenced_blocks(self):
         runner = _runner()

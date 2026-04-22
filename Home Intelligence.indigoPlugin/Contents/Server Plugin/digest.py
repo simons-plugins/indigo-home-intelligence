@@ -56,6 +56,18 @@ GOALS
 - Never re-suggest something the owner has already declined or that is
   already automated by an existing trigger, schedule, or agent rule.
 
+EVENT LOG FORMAT
+The event log is delivered in two fenced code blocks in the user message:
+
+- ``event_log_summary`` — one compact JSON object with aggregate counts
+  (``total_events``, ``top_sources``, ``events_by_hour``,
+  ``sql_logger_rollups``).
+- ``event_log_timeline`` — JSON-lines, chronological, one **positional
+  array** per line with the shape
+  ``["YYYY-MM-DD HH:MM:SS", source, message]``. Milliseconds are
+  omitted. Multi-line tracebacks inside ``message`` appear as escaped
+  ``\\n`` inside the string.
+
 REASONING OVER THE EVENT LOG
 You are given the last 7 days of Indigo event log narrations alongside
 the static house model. Use them to understand what ACTUALLY happens,
@@ -101,7 +113,7 @@ The JSON object must have this shape:
 
   {
     "subject": "<email subject line, 40-80 chars>",
-    "narrative_markdown": "<digest body as Markdown, 200-600 words, inverted pyramid: headline paragraph, a timeline or observation, inference, closing line>",
+    "narrative_markdown": "<digest body as Markdown, see NARRATIVE STRUCTURE>",
     "observation": null | {
       "headline": "<one-line summary of the observation>",
       "rationale": "<1-3 sentences: WHY you're flagging this>",
@@ -110,9 +122,45 @@ The JSON object must have this shape:
     }
   }
 
-If nothing is worth the owner's attention this week, set `observation`
-to null. It's better to say "quiet week, everything looks healthy" than
-to invent a concern.
+SUBJECT FORMAT
+Start the subject with the week range in the form "Week of D-D Mon:"
+followed by a short headline summarising this week. 40-80 chars total.
+The plugin appends an "[obs-XXXXXX]" reply token; you don't include it.
+Examples:
+  "Week of 14-21 Apr: Dining TRV keeps dropping off"
+  "Week of 14-21 Apr: quiet week, everything healthy"
+
+NARRATIVE STRUCTURE
+Always follow this order. Don't deviate even when the week is quiet —
+the consistent shape is what makes the weekly email feel like a
+newsletter rather than an alert.
+
+  1. Opening section with "## <warm weekly-status heading>"
+     — one paragraph (3-5 sentences) giving the big picture of the
+     week: what's running smoothly, what agent rules are quietly
+     holding, notable calm. Addresses the owner directly as "you".
+     Even when flagging an observation, lead with the roundup FIRST
+     so the observation lands in context rather than cold.
+
+  2. "### What caught my eye"
+     — 2-4 paragraphs describing the observation in narrative prose.
+     Use **bold** sparingly to highlight device names or key facts.
+     Omit this section entirely (and the next) on a quiet week with
+     observation=null.
+
+  3. "### The inference"
+     — 1-2 paragraphs explaining WHY this pattern matters and what a
+     proposed rule would do differently. Omit on a quiet week.
+
+  4. Closing line
+     — warm single sentence inviting a reply, or (on a quiet week)
+     a reassuring one-liner confirming nothing requires attention.
+
+For quiet weeks (observation=null): expand the opening roundup to
+2-3 paragraphs covering each category (heating, lighting, security,
+cost / automations) rather than collapsing it. It's better to say
+"quiet week, everything looks healthy" at length than to invent a
+concern.
 
 Keep the narrative warm and direct, not corporate. Refer to the owner
 as "you".
@@ -220,7 +268,15 @@ class DigestRunner:
             )
             return None
 
-        return self._deliver(parsed)
+        # Soft-warn on narrative-shape drift. A slightly-off-shape digest
+        # is still worth delivering — the schema is already enforced
+        # above; the shape checks are about prompt adherence, not
+        # correctness. Logging at warning keeps drift visible without
+        # dropping the week's digest.
+        for shape_warning in self._shape_warnings(parsed):
+            self.logger.warning(f"Digest shape: {shape_warning}")
+
+        return self._deliver(parsed, usage, cost_gbp)
 
     # ------------------------------------------------------------------
     # Prompt construction
@@ -229,13 +285,16 @@ class DigestRunner:
     def _build_system_blocks(
         self, house_model: dict, rules: List[dict], prior_observations: List[dict]
     ) -> List[dict]:
+        # Compact JSON — the cached block pays 1.25x the base input rate,
+        # so every byte of pretty-print whitespace costs real money for
+        # zero reasoning benefit. Claude doesn't read indentation.
         context = (
             "HOUSE MODEL\n"
-            f"{json.dumps(house_model, indent=2)}\n\n"
+            f"{json.dumps(house_model, separators=(',', ':'))}\n\n"
             "EXISTING AGENT RULES (already enforced by the plugin)\n"
-            f"{json.dumps(rules, indent=2) if rules else '(none yet)'}\n\n"
+            f"{json.dumps(rules, separators=(',', ':')) if rules else '(none yet)'}\n\n"
             "RECENT OBSERVATIONS (past suggestions — avoid repeating)\n"
-            f"{json.dumps(prior_observations, indent=2) if prior_observations else '(none yet)'}"
+            f"{json.dumps(prior_observations, separators=(',', ':')) if prior_observations else '(none yet)'}"
         )
         return [
             {"type": "text", "text": INSTRUCTIONS},
@@ -252,33 +311,49 @@ class DigestRunner:
     ) -> str:
         """Build the volatile user-message block for the digest call.
 
-        The event log is rendered as two fenced code blocks so Claude can
-        parse them deterministically:
+        Compact JSON throughout — Claude doesn't read indentation and the
+        event log dominates the uncached input cost, so every byte of
+        structural overhead matters:
 
-        - ``event_log_summary`` — a single JSON object containing
-          aggregate counts plus ``sql_logger_rollups`` (per-device 7-day
-          activity counts from SQL Logger).
-        - ``event_log_timeline`` — JSON-lines (one object per line), so
-          multi-line error tracebacks in a single event's ``message``
-          survive without being broken by whatever delimiter the prompt
-          uses."""
+        - ``event_log_summary`` — compact JSON object (no indent).
+        - ``event_log_timeline`` — JSON-lines of **positional arrays**
+          ``["MM-DD HH:MM:SS", source, message]`` rather than keyed
+          objects. Drops ~15 tokens/event of repeated JSON keys and
+          the ``20YY-`` / ``.mmm`` timestamp prefix/suffix. Schema is
+          documented in INSTRUCTIONS so Claude knows the positions.
+
+        Multi-line tracebacks in ``message`` still survive because
+        embedded newlines are escaped as ``\\n`` inside the JSON string."""
         local_now = now.astimezone()
-        summary_block = json.dumps(event_summary, indent=2)
-        timeline_lines = [json.dumps(e) for e in events]
+        summary_block = json.dumps(event_summary, separators=(',', ':'))
+        # Timestamp slicing: "2026-04-22 07:37:42.510"[:19] -> "2026-04-22 07:37:42"
+        # Drops milliseconds (not load-bearing at weekly resolution) but
+        # keeps the year — digest windows can cross New Year (e.g. a run
+        # on 4 Jan covers 28 Dec - 4 Jan) and a year-less "MM-DD" timestamp
+        # would sort wrongly across the boundary.
+        timeline_lines = [
+            json.dumps(
+                [e["timestamp"][:19], e["source"], e["message"]],
+                separators=(',', ':'),
+            )
+            for e in events
+        ]
         timeline_block = "\n".join(timeline_lines)
 
         return (
             f"Current local time: {local_now.isoformat(timespec='minutes')}\n"
             f"Digest window: last {window_days} days "
             f"({since.date().isoformat()} to {now.date().isoformat()})\n\n"
-            "EVENT LOG SUMMARY (JSON — totals, top sources, hourly "
+            "EVENT LOG SUMMARY (compact JSON — totals, top sources, hourly "
             "distribution, and per-device 7-day SQL Logger rollups)\n"
             "```event_log_summary\n"
             f"{summary_block}\n"
             "```\n\n"
-            "EVENT LOG TIMELINE (JSON-lines, chronological — one event "
-            "per line, full message field preserved including multi-line "
-            "tracebacks)\n"
+            "EVENT LOG TIMELINE (JSON-lines positional arrays, "
+            "chronological — schema: "
+            "[\"YYYY-MM-DD HH:MM:SS\", source, message]; "
+            "multi-line tracebacks in the message field survive as "
+            "escaped \\n)\n"
             "```event_log_timeline\n"
             f"{timeline_block}\n"
             "```\n\n"
@@ -709,6 +784,40 @@ class DigestRunner:
     _ALLOWED_RULE_OPS = {"on", "off", "toggle", "set_brightness"}
 
     @classmethod
+    def _shape_warnings(cls, parsed: dict) -> List[str]:
+        """Check the parsed output against the pinned narrative shape in
+        INSTRUCTIONS: ``Week of ...`` subject prefix, ``## ``
+        weekly-status heading, and (when an observation is flagged)
+        both ``### What caught my eye`` and ``### The inference``
+        sections.
+
+        Returns a list of warning strings, empty if the shape is fine.
+        Non-blocking — the caller logs these but still delivers the
+        digest. Blocking validation lives in ``_validate_parsed``."""
+        warnings: List[str] = []
+        subject = parsed.get("subject", "") or ""
+        if not subject.startswith("Week of "):
+            warnings.append(
+                f"subject missing 'Week of' prefix: {subject[:80]!r}"
+            )
+
+        narrative = parsed.get("narrative_markdown", "") or ""
+        if "## " not in narrative:
+            warnings.append("narrative_markdown missing any '## ' heading")
+
+        observation = parsed.get("observation")
+        if isinstance(observation, dict):
+            if "### What caught my eye" not in narrative:
+                warnings.append(
+                    "narrative_markdown missing '### What caught my eye' section"
+                )
+            if "### The inference" not in narrative:
+                warnings.append(
+                    "narrative_markdown missing '### The inference' section"
+                )
+        return warnings
+
+    @classmethod
     def _validate_parsed(cls, parsed: object) -> Optional[str]:
         """Check that a parsed JSON response matches the documented digest
         schema. Returns None on success, a short error string on failure.
@@ -825,7 +934,9 @@ class DigestRunner:
                     return None
             return None
 
-    def _deliver(self, parsed: dict) -> Optional[str]:
+    def _deliver(
+        self, parsed: dict, usage: dict, cost_gbp: float
+    ) -> Optional[str]:
         subject = (parsed.get("subject") or "Home Intelligence — weekly digest").strip()
         body_markdown = parsed.get("narrative_markdown") or "(empty digest)"
         observation = parsed.get("observation")
@@ -844,6 +955,10 @@ class DigestRunner:
                 body_markdown = self._append_reply_footer(body_markdown, stored_obs)
             except Exception as exc:
                 self.logger.exception(f"Failed to persist observation: {exc}")
+
+        # Always append cost to the email — makes the weekly run
+        # self-observable without having to check the Indigo log.
+        body_markdown = self._append_cost_footer(body_markdown, usage, cost_gbp)
 
         # Classified send so we can distinguish permanent from transient
         # SMTP failure. On a permanent failure we roll back the
@@ -901,3 +1016,29 @@ class DigestRunner:
                 "Reply **NO** if this observation isn't useful and I'll stop flagging it."
             )
         return body.rstrip() + "\n" + "\n".join(footer_lines)
+
+    @staticmethod
+    def _append_cost_footer(body: str, usage: dict, cost_gbp: float) -> str:
+        """Append a single-line cost/usage summary to the digest body.
+
+        Always runs regardless of whether an observation was flagged, so
+        "quiet week" digests (observation=null, no reply footer) still
+        show the run cost. Helps the user sanity-check monthly spend
+        against the configured cap without needing to scan Indigo logs.
+        Token figures use thousands separators so they're readable in a
+        Markdown body."""
+        in_tokens = usage.get("input_tokens", 0)
+        out_tokens = usage.get("output_tokens", 0)
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        cache_write = usage.get("cache_creation_input_tokens", 0)
+        cost_line = (
+            f"_Run cost: ~£{cost_gbp:.2f} — "
+            f"in {in_tokens:,}, out {out_tokens:,}, "
+            f"cache read {cache_read:,}, cache write {cache_write:,}._"
+        )
+        # Insert a horizontal rule only if the body doesn't already end
+        # with one (i.e. there was no reply footer before us).
+        stripped = body.rstrip()
+        if stripped.endswith("---"):
+            return stripped + "\n\n" + cost_line + "\n"
+        return stripped + "\n\n---\n\n" + cost_line + "\n"

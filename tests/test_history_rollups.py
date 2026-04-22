@@ -150,10 +150,20 @@ class TestDiagnosePgError:
         db = self._db()
         stderr = 'FATAL:  database "nosuchdb" does not exist'
         hint = db._diagnose_pg_error(stderr)
-        # "does not exist" matches role hint first — that's acceptable
-        # because role errors and database errors both suggest checking
-        # the Plugin Configure dialog. Either hint is actionable.
-        assert "Plugin Configure" in hint
+        # Specific 'database "' match fires before the generic
+        # "does not exist" rule, so database-not-found classifies as a
+        # database error rather than being misreported as a role error.
+        assert "database doesn't exist" in hint
+        assert "Postgres database" in hint
+
+    def test_missing_role_still_classifies_as_role(self):
+        db = self._db()
+        stderr = 'psql error: FATAL:  role "Simon" does not exist'
+        hint = db._diagnose_pg_error(stderr)
+        # No 'database "' in this stderr, so the generic 'does not exist'
+        # rule fires and correctly reports a role error.
+        assert "role (user) not found" in hint
+        assert "Postgres user" in hint
 
     def test_unrecognised_error_falls_through(self):
         db = self._db()
