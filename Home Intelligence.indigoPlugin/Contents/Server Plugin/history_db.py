@@ -529,70 +529,60 @@ class HistoryDB:
                 self.logger.error(f"Error running energy rollup: {msg}")
             return {}
 
-        # Diagnostic: log the first two rows verbatim when rollup is
-        # about to return empty from a non-empty query. Otherwise
-        # "Energy rollup: 0 devices have 14d history" gives no clue
-        # whether rows came back at all, whether values were NULL, or
-        # whether the comparison failed.
-        if rows:
-            sample = rows[:2]
-            self.logger.info(
-                f"Energy rollup sample (first 2 of {len(rows)} rows): {sample!r}"
-            )
-
         out = {}
-        malformed_rows = 0
         for row in rows:
-            # Psql's unaligned tab-separated output can occasionally
-            # return rows with fewer fields than expected when all
-            # scalar-subquery columns are NULL (the exact behaviour
-            # varies by psql version); guard rather than crash the
-            # whole rollup.
+            # psql with --unaligned + --pset null="" trims trailing empty
+            # fields — a row with NULL in the last column(s) comes back
+            # with fewer tab-separated fields than the query defined.
+            # Pad with empty strings so unpacking is safe and downstream
+            # NULL-checks just see "" as expected.
             if len(row) < 4:
-                malformed_rows += 1
-                self.logger.debug(
-                    f"Energy rollup: skipping short row {row!r}"
-                )
-                continue
+                row = tuple(row) + ("",) * (4 - len(row))
             did_raw, now_v_raw, w1_raw, w2_raw = row[0], row[1], row[2], row[3]
             try:
                 did = int(did_raw)
             except (TypeError, ValueError):
                 continue
-            # Need all three snapshots to compute a WoW comparison.
-            if any(v in (None, "") for v in (now_v_raw, w1_raw, w2_raw)):
+            # This-week (now - 7d-ago) is the primary metric; emit
+            # partial data when the 14d-ago snapshot is missing, since
+            # the week's consumption is still useful without the WoW
+            # comparison. Many devices have sparse old data even when
+            # current logging is dense.
+            if now_v_raw in (None, "") or w1_raw in (None, ""):
                 continue
             try:
                 now_v = float(now_v_raw)
                 w1 = float(w1_raw)
-                w2 = float(w2_raw)
             except (TypeError, ValueError):
                 continue
             this_week = round(now_v - w1, 3)
-            last_week = round(w1 - w2, 3)
-            delta_kwh = round(this_week - last_week, 3)
-            if last_week == 0:
-                delta_pct = None
-            else:
-                delta_pct = round(100.0 * delta_kwh / last_week, 1)
+
+            last_week: Optional[float] = None
+            delta_kwh: Optional[float] = None
+            delta_pct: Optional[float] = None
+            if w2_raw not in (None, ""):
+                try:
+                    w2 = float(w2_raw)
+                    last_week = round(w1 - w2, 3)
+                    delta_kwh = round(this_week - last_week, 3)
+                    if last_week == 0:
+                        delta_pct = None
+                    else:
+                        delta_pct = round(100.0 * delta_kwh / last_week, 1)
+                except (TypeError, ValueError):
+                    pass
             out[did] = {
                 "this_week_kwh": this_week,
                 "last_week_kwh": last_week,
                 "delta_kwh": delta_kwh,
                 "delta_pct": delta_pct,
             }
+        with_wow = sum(1 for d in out.values() if d.get("last_week_kwh") is not None)
         self.logger.info(
-            f"Energy rollup: {len(out)} device(s) have 14d history "
-            f"(from {len(valid_ids)} queried, {malformed_rows} malformed)"
+            f"Energy rollup: {len(out)} device(s) have this-week usage "
+            f"(of which {with_wow} also have last-week for WoW delta); "
+            f"queried {len(valid_ids)}"
         )
-        if out:
-            # Surface the actual surviving device IDs so the operator
-            # can see whether their configured whole-house device made
-            # it through (and identify which individual devices are
-            # actually being logged).
-            self.logger.info(
-                f"Energy rollup: devices with 14d history: {sorted(out.keys())}"
-            )
         return out
 
     def close(self):

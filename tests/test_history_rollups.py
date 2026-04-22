@@ -277,10 +277,10 @@ class TestEnergyRollup14d:
         assert rollup[100]["delta_kwh"] == -5.0
         assert rollup[100]["delta_pct"] == -16.7
 
-    def test_insufficient_history_omits_device(self, tmp_path):
-        # Device 100 only has one row (now) — no 7d or 14d snapshot.
-        # Expected: omitted from the result rather than reported with
-        # null fields.
+    def test_missing_now_or_7d_omits_device(self, tmp_path):
+        # Device 100 only has one row (now) — no 7d snapshot. Without
+        # both now + 7d-ago we can't compute this-week consumption, so
+        # drop.
         db_path = _build_energy_db(
             tmp_path,
             {100: [(0.1, 5.0)]},
@@ -291,6 +291,33 @@ class TestEnergyRollup14d:
             sqlite_path=str(db_path),
         )
         assert db.energy_rollup_14d([100]) == {}
+
+    def test_missing_14d_emits_partial(self, tmp_path):
+        # Device has now + 7d-ago but no 14d-ago snapshot (common on
+        # the Aeon HEM: the column was added after the oldest rows
+        # were written). Emit this_week_kwh; mark last_week and
+        # delta fields as None.
+        db_path = _build_energy_db(
+            tmp_path,
+            {
+                100: [
+                    (0.1, 155.0),    # now
+                    (24 * 7, 130.0),  # 7 days ago
+                    # No 14d row.
+                ],
+            },
+        )
+        db = HistoryDB(
+            db_type="sqlite",
+            logger=_NullLogger(),
+            sqlite_path=str(db_path),
+        )
+        rollup = db.energy_rollup_14d([100])
+        assert 100 in rollup
+        assert rollup[100]["this_week_kwh"] == 25.0
+        assert rollup[100]["last_week_kwh"] is None
+        assert rollup[100]["delta_kwh"] is None
+        assert rollup[100]["delta_pct"] is None
 
     def test_zero_baseline_reports_delta_pct_none(self, tmp_path):
         # If last week was 0 kWh (device was idle), delta_pct would be
