@@ -398,6 +398,158 @@ class HistoryDB:
                 )
         return out
 
+    def discover_energy_tables(self):
+        """Return the device IDs whose history table has an
+        ``accumEnergyTotal`` column. One metadata query — avoids
+        probing every device table individually to find out whether
+        energy history exists.
+
+        SQL Logger stores a ``accumEnergyTotal`` column on devices
+        that publish that state (smart plugs, energy meters); devices
+        without energy metering don't have the column so we skip them
+        cleanly rather than querying and hitting 'column doesn't exist'
+        once per device.
+
+        Returns a list of device IDs (ints), empty on query failure."""
+        try:
+            if self.db_type == "sqlite":
+                # SQLite stores column info per-table — pragma_table_info
+                # doesn't filter across tables so we use sqlite_master +
+                # a LIKE on the CREATE statement. Fast on a 500-device
+                # house (<50ms).
+                sql = (
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' "
+                    "AND name LIKE 'device_history_%' "
+                    "AND sql LIKE '%accumEnergyTotal%'"
+                )
+                _, rows = self._execute(sql)
+                table_names = [r[0] for r in rows]
+            else:
+                sql = (
+                    "SELECT table_name FROM information_schema.columns "
+                    "WHERE column_name = 'accumEnergyTotal' "
+                    "AND table_schema = 'public' "
+                    "AND table_name LIKE 'device_history_%'"
+                )
+                _, rows = self._execute(sql)
+                table_names = [r[0] for r in rows]
+        except Exception as exc:
+            msg = str(exc)
+            if self.db_type == "postgresql":
+                hint = self._diagnose_pg_error(msg)
+                self.logger.error(
+                    f"SQL Logger energy-table discovery failed: {hint}. Raw: {msg}"
+                )
+            else:
+                self.logger.error(f"Error discovering energy tables: {msg}")
+            return []
+
+        device_ids = []
+        for name in table_names:
+            parts = name.split("device_history_")
+            if len(parts) == 2 and parts[1].isdigit():
+                device_ids.append(int(parts[1]))
+        return device_ids
+
+    def energy_rollup_14d(self, device_ids):
+        """Per-device energy snapshots at now / -7d / -14d.
+
+        Returns ``{device_id: {"this_week_kwh": float, "last_week_kwh":
+        float, "delta_kwh": float, "delta_pct": float | None}}``.
+        Devices with insufficient history (less than 14 days of data)
+        are omitted rather than reported with zero/null values — a
+        week-over-week comparison isn't meaningful without both points.
+
+        Uses a single UNION ALL query per backend (not one query per
+        device) — on PG that means a single ``psql`` invocation rather
+        than N × subprocess overhead, which matters once you have 100+
+        energy-logged devices.
+
+        ``delta_pct`` is ``None`` when ``last_week_kwh`` is zero to
+        avoid divide-by-zero; the caller treats this as 'no baseline,
+        can't compare'."""
+        if not device_ids:
+            return {}
+        valid_ids = [did for did in device_ids if isinstance(did, int)]
+        if not valid_ids:
+            return {}
+
+        now = datetime.now(timezone.utc)
+        week_ago_ts = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        two_weeks_ago_ts = (now - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Build one UNION ALL query: one row per device with three
+        # scalar-subquery columns (now, -7d, -14d).
+        parts = []
+        for did in valid_ids:
+            table = f'"device_history_{did}"'
+            if self.db_type == "sqlite":
+                parts.append(
+                    f"SELECT {did} AS id, "
+                    f"(SELECT accumEnergyTotal FROM {table} "
+                    f"ORDER BY ts DESC LIMIT 1) AS now_v, "
+                    f"(SELECT accumEnergyTotal FROM {table} "
+                    f"WHERE ts <= '{week_ago_ts}' ORDER BY ts DESC LIMIT 1) AS w1, "
+                    f"(SELECT accumEnergyTotal FROM {table} "
+                    f"WHERE ts <= '{two_weeks_ago_ts}' ORDER BY ts DESC LIMIT 1) AS w2"
+                )
+            else:
+                parts.append(
+                    f"SELECT {did} AS id, "
+                    f"(SELECT accumEnergyTotal FROM {table} "
+                    f"ORDER BY ts DESC LIMIT 1) AS now_v, "
+                    f"(SELECT accumEnergyTotal FROM {table} "
+                    f"WHERE ts <= '{week_ago_ts}' ORDER BY ts DESC LIMIT 1) AS w1, "
+                    f"(SELECT accumEnergyTotal FROM {table} "
+                    f"WHERE ts <= '{two_weeks_ago_ts}' ORDER BY ts DESC LIMIT 1) AS w2"
+                )
+        sql = " UNION ALL ".join(parts)
+
+        try:
+            _, rows = self._execute(sql)
+        except Exception as exc:
+            msg = str(exc)
+            if self.db_type == "postgresql":
+                hint = self._diagnose_pg_error(msg)
+                self.logger.error(
+                    f"SQL Logger energy rollup failed: {hint}. Raw: {msg}"
+                )
+            else:
+                self.logger.error(f"Error running energy rollup: {msg}")
+            return {}
+
+        out = {}
+        for row in rows:
+            did_raw, now_v_raw, w1_raw, w2_raw = row[0], row[1], row[2], row[3]
+            try:
+                did = int(did_raw)
+            except (TypeError, ValueError):
+                continue
+            # Need all three snapshots to compute a WoW comparison.
+            if any(v in (None, "") for v in (now_v_raw, w1_raw, w2_raw)):
+                continue
+            try:
+                now_v = float(now_v_raw)
+                w1 = float(w1_raw)
+                w2 = float(w2_raw)
+            except (TypeError, ValueError):
+                continue
+            this_week = round(now_v - w1, 3)
+            last_week = round(w1 - w2, 3)
+            delta_kwh = round(this_week - last_week, 3)
+            if last_week == 0:
+                delta_pct = None
+            else:
+                delta_pct = round(100.0 * delta_kwh / last_week, 1)
+            out[did] = {
+                "this_week_kwh": this_week,
+                "last_week_kwh": last_week,
+                "delta_kwh": delta_kwh,
+                "delta_pct": delta_pct,
+            }
+        return out
+
     def close(self):
         """No persistent connections to close (SQLite opens per-query, PG uses psql CLI)."""
         pass

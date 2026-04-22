@@ -172,7 +172,7 @@ class TestDiagnosePgError:
 
 
 class TestRollup7dExtras:
-    def test_non_int_device_id_skipped(self, tmp_path):
+    def test_non_int_device_id_skipped_rollup_7d(self, tmp_path):
         db_path = _build_db(tmp_path, {100: [(1, 1.0)]})
         db = HistoryDB(
             db_type="sqlite",
@@ -186,3 +186,152 @@ class TestRollup7dExtras:
         assert 100 in rollups
         assert "malformed" not in rollups
         assert 999.5 not in rollups
+
+
+def _build_energy_db(tmp_path: Path, data: dict) -> Path:
+    """Build a SQLite DB with device_history_{id} tables carrying an
+    ``accumEnergyTotal`` column. ``data`` is
+    ``{device_id: [(hours_ago, accum_kwh), ...]}`` — each tuple is one
+    row with a cumulative kWh value. ``ts`` is UTC-stamped to match
+    real SQL Logger storage."""
+    db_path = tmp_path / "energy.db"
+    conn = sqlite3.connect(str(db_path))
+    now = datetime.now(timezone.utc)
+    for device_id, rows in data.items():
+        conn.execute(
+            f'CREATE TABLE "device_history_{device_id}" '
+            f"(id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, accumEnergyTotal REAL)"
+        )
+        for hours_ago, kwh in rows:
+            ts = (now - timedelta(hours=hours_ago)).strftime(
+                "%Y-%m-%d %H:%M:%S"
+            )
+            conn.execute(
+                f'INSERT INTO "device_history_{device_id}" (ts, accumEnergyTotal) '
+                f"VALUES (?, ?)",
+                (ts, kwh),
+            )
+    conn.commit()
+    conn.close()
+    return db_path
+
+
+class TestDiscoverEnergyTables:
+    def test_finds_tables_with_accumEnergyTotal_column(self, tmp_path):
+        db_path = tmp_path / "mixed.db"
+        conn = sqlite3.connect(str(db_path))
+        # 100: energy device (has accumEnergyTotal)
+        conn.execute(
+            'CREATE TABLE "device_history_100" '
+            "(id INTEGER PRIMARY KEY, ts TEXT, accumEnergyTotal REAL)"
+        )
+        # 200: non-energy device (temperature sensor)
+        conn.execute(
+            'CREATE TABLE "device_history_200" '
+            "(id INTEGER PRIMARY KEY, ts TEXT, sensorValue REAL)"
+        )
+        # 300: also energy
+        conn.execute(
+            'CREATE TABLE "device_history_300" '
+            "(id INTEGER PRIMARY KEY, ts TEXT, accumEnergyTotal REAL, curEnergyLevel REAL)"
+        )
+        conn.commit()
+        conn.close()
+        db = HistoryDB(
+            db_type="sqlite",
+            logger=_NullLogger(),
+            sqlite_path=str(db_path),
+        )
+        ids = db.discover_energy_tables()
+        assert set(ids) == {100, 300}
+
+
+class TestEnergyRollup14d:
+    def test_computes_this_week_last_week_and_delta(self, tmp_path):
+        # Device 100: started the fortnight at 100 kWh cumulative, was at
+        # 130 kWh one week ago, now at 155 kWh. So last_week = 30 kWh,
+        # this_week = 25 kWh, delta = -5, delta_pct ≈ -16.7.
+        db_path = _build_energy_db(
+            tmp_path,
+            {
+                100: [
+                    (0.1, 155.0),   # ~ now
+                    (24 * 7, 130.0),  # 7 days ago
+                    (24 * 14, 100.0),  # 14 days ago
+                ],
+            },
+        )
+        db = HistoryDB(
+            db_type="sqlite",
+            logger=_NullLogger(),
+            sqlite_path=str(db_path),
+        )
+        rollup = db.energy_rollup_14d([100])
+        assert 100 in rollup
+        assert rollup[100]["this_week_kwh"] == 25.0
+        assert rollup[100]["last_week_kwh"] == 30.0
+        assert rollup[100]["delta_kwh"] == -5.0
+        assert rollup[100]["delta_pct"] == -16.7
+
+    def test_insufficient_history_omits_device(self, tmp_path):
+        # Device 100 only has one row (now) — no 7d or 14d snapshot.
+        # Expected: omitted from the result rather than reported with
+        # null fields.
+        db_path = _build_energy_db(
+            tmp_path,
+            {100: [(0.1, 5.0)]},
+        )
+        db = HistoryDB(
+            db_type="sqlite",
+            logger=_NullLogger(),
+            sqlite_path=str(db_path),
+        )
+        assert db.energy_rollup_14d([100]) == {}
+
+    def test_zero_baseline_reports_delta_pct_none(self, tmp_path):
+        # If last week was 0 kWh (device was idle), delta_pct would be
+        # divide-by-zero. Emit None so the caller treats it as
+        # 'no baseline to compare'.
+        db_path = _build_energy_db(
+            tmp_path,
+            {
+                100: [
+                    (0.1, 5.0),
+                    (24 * 7, 5.0),   # same as now → this_week = 0
+                    (24 * 14, 5.0),  # same → last_week = 0
+                ],
+            },
+        )
+        db = HistoryDB(
+            db_type="sqlite",
+            logger=_NullLogger(),
+            sqlite_path=str(db_path),
+        )
+        rollup = db.energy_rollup_14d([100])
+        assert 100 in rollup
+        assert rollup[100]["last_week_kwh"] == 0.0
+        assert rollup[100]["delta_pct"] is None
+
+    def test_empty_device_list_returns_empty(self, tmp_path):
+        db_path = _build_energy_db(tmp_path, {})
+        db = HistoryDB(
+            db_type="sqlite",
+            logger=_NullLogger(),
+            sqlite_path=str(db_path),
+        )
+        assert db.energy_rollup_14d([]) == {}
+
+    def test_non_int_device_id_filtered(self, tmp_path):
+        db_path = _build_energy_db(
+            tmp_path,
+            {100: [(0.1, 5.0), (24 * 7, 3.0), (24 * 14, 1.0)]},
+        )
+        db = HistoryDB(
+            db_type="sqlite",
+            logger=_NullLogger(),
+            sqlite_path=str(db_path),
+        )
+        rollup = db.energy_rollup_14d([100, "garbage", None, 999.5])
+        # Only 100 is a valid int; nothing else should leak into the
+        # dynamic SQL.
+        assert list(rollup.keys()) == [100]

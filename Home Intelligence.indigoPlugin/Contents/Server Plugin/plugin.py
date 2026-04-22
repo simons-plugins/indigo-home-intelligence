@@ -53,6 +53,30 @@ def _as_bool(value, default: bool = False) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes", "on")
 
 
+def _as_int(value, default: int) -> int:
+    """Coerce an Indigo textfield pref (stored as string) to int.
+    Falls back to ``default`` on None / empty / invalid."""
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_optional_int(value):
+    """Coerce an Indigo textfield pref to an optional int — returns
+    None when the pref is blank, rather than a fallback. Used for
+    truly-optional settings like the whole-house energy device ID
+    where absence is meaningful."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class Plugin(indigo.PluginBase):
     def __init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs):
         super().__init__(pluginId, pluginDisplayName, pluginVersion, pluginPrefs)
@@ -134,6 +158,15 @@ class Plugin(indigo.PluginBase):
             model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
             email_to=self.pluginPrefs.get("digestEmailTo", ""),
             logger=self.logger,
+            whole_house_energy_device_id=_as_optional_int(
+                self.pluginPrefs.get("wholeHouseEnergyDeviceId")
+            ),
+            battery_low_threshold=_as_int(
+                self.pluginPrefs.get("batteryLowThreshold"), 20
+            ),
+            offline_hours_threshold=_as_int(
+                self.pluginPrefs.get("offlineHoursThreshold"), 24
+            ),
         )
 
     # ------------------------------------------------------------------
