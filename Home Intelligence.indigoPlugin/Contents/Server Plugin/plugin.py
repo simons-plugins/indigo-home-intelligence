@@ -35,6 +35,94 @@ DAYS_OF_WEEK = {
     "friday": 4, "saturday": 5, "sunday": 6,
 }
 
+# Plugin-ID substrings that mark a device as unsafe for agent rule
+# targeting — security systems, locks, alarms. A YES reply to an
+# observation whose proposed_rule targets one of these is rejected
+# with a mailed notice, preventing a rushed approval from disarming
+# the house. Matches lowercase pluginId prefix/substring.
+UNSAFE_RULE_TARGET_PLUGIN_SUBSTRINGS = (
+    "texecom",       # alarm panel
+    "securityspy",   # camera server
+    "lockitron",     # smart lock
+    "schlage",       # smart lock
+    "yale",          # smart lock
+    "alarm",         # generic
+)
+
+
+def _is_safe_rule_target(device_id) -> bool:
+    """Return True if `device_id` is a valid target for an agent rule.
+
+    Safe = controllable power surface (dimmer / relay / smart plug).
+    Unsafe = thermostats (setpoints are high-stakes, user changes
+    manually), security systems / cameras / locks (safety-critical),
+    and devices with no power surface (sensors, irrigation).
+
+    Conservative by design — a rule that fails this check is rejected
+    rather than silently accepted. The LLM is instructed to avoid
+    proposing such rules; this is the server-side gate."""
+    if not isinstance(device_id, int):
+        return False
+    if device_id not in indigo.devices:
+        return False
+    dev = indigo.devices[device_id]
+    # Thermostats: explicit reject.
+    if hasattr(dev, "temperatureInputs"):
+        return False
+    # Must have a power-switchable surface.
+    if not (hasattr(dev, "brightness") or hasattr(dev, "onState")):
+        return False
+    # Plugin ID denylist for safety-critical categories.
+    plugin_id = (getattr(dev, "pluginId", "") or "").lower()
+    for needle in UNSAFE_RULE_TARGET_PLUGIN_SUBSTRINGS:
+        if needle in plugin_id:
+            return False
+    return True
+
+
+def _render_rule_human(rule: dict) -> str:
+    """Return a plain-language summary of a rule for confirmation email.
+
+    Resolves device IDs to names via indigo.devices so the user sees
+    'Coffee Machine' not just a bare integer. Formats the when/then
+    clauses as natural English."""
+    when = rule.get("when", {}) or {}
+    then = rule.get("then", {}) or {}
+    when_dev_id = when.get("device_id")
+    then_dev_id = then.get("device_id")
+
+    def _name(did):
+        if did in indigo.devices:
+            return indigo.devices[did].name
+        return f"device {did}"
+
+    parts = [f"When **{_name(when_dev_id)}** (id `{when_dev_id}`) has"]
+    state = when.get("state", "onState")
+    equals = when.get("equals")
+    parts.append(f"`{state}` = `{equals}`")
+    after = when.get("after_local_time")
+    before = when.get("before_local_time")
+    if after and before:
+        parts.append(f"between **{after}** and **{before}**")
+    elif after:
+        parts.append(f"after **{after}**")
+    elif before:
+        parts.append(f"before **{before}**")
+    for_minutes = when.get("for_minutes")
+    if for_minutes:
+        parts.append(f"for at least **{for_minutes} minutes**")
+    parts.append("→")
+    op = then.get("op", "?")
+    value = then.get("value")
+    op_desc = {
+        "on": "turn on",
+        "off": "turn off",
+        "toggle": "toggle",
+        "set_brightness": f"set brightness to {value}",
+    }.get(op, op)
+    parts.append(f"{op_desc} **{_name(then_dev_id)}** (id `{then_dev_id}`).")
+    return " ".join(parts)
+
 
 def _as_bool(value, default: bool = False) -> bool:
     """Coerce an Indigo checkbox pref to a real bool.
@@ -113,6 +201,7 @@ class Plugin(indigo.PluginBase):
             self._init_observation_store()
             self.rule_evaluator = RuleEvaluator(self.rule_store, self.logger)
             self._rebuild_clients()
+            self._refresh_state_variables()
             self.logger.info("Home Intelligence startup complete")
         except Exception as exc:
             self.logger.exception(f"Startup failed: {exc}")
@@ -290,10 +379,84 @@ class Plugin(indigo.PluginBase):
             return
         self.logger.info(f"Agent rules ({len(rules)}):")
         for rule in rules:
-            status = "enabled" if rule.get("enabled") else "DISABLED"
+            if rule.get("auto_disabled"):
+                status = (
+                    f"AUTO-DISABLED ({rule.get('auto_disabled_reason', '?')}"
+                    f" @ {rule.get('auto_disabled_at', '?')})"
+                )
+            elif rule.get("enabled"):
+                status = "enabled"
+            else:
+                status = "DISABLED"
+            fires = rule.get("fires_count", 0)
+            last = rule.get("last_fired_at") or "never"
             self.logger.info(
-                f"  [{rule.get('id')}] {status}: {rule.get('description', '(no description)')}"
+                f"  [{rule.get('id')}] {status} "
+                f"(fires={fires}, last={last}): "
+                f"{rule.get('description', '(no description)')}"
             )
+
+    def menuManageRuleRuleList(self, filter="", valuesDict=None, typeId="", targetId=0):
+        """Populate the 'Rule:' dropdown in the Manage Rule... dialog
+        with the current set of agent rules. Indigo invokes this on
+        dialog open. Each option is (rule_id, human label)."""
+        rules = self.rule_store.list_rules() if self.rule_store else []
+        out = []
+        for rule in rules:
+            rule_id = rule.get("id", "?")
+            desc = rule.get("description", "(no description)")
+            if rule.get("auto_disabled"):
+                marker = " [auto-disabled]"
+            elif rule.get("enabled"):
+                marker = ""
+            else:
+                marker = " [disabled]"
+            # Truncate long descriptions so the dropdown stays usable.
+            short = desc if len(desc) < 60 else desc[:57] + "..."
+            out.append((rule_id, f"{rule_id}: {short}{marker}"))
+        if not out:
+            out.append(("", "(no rules stored)"))
+        return out
+
+    def menuManageRule(self, valuesDict, typeId):
+        """Apply the user's chosen enable/disable/delete action to a
+        specific rule. Invoked by the Manage Rule... menu item's OK
+        button."""
+        rule_id = valuesDict.get("rule_id", "").strip()
+        action = valuesDict.get("action", "").strip()
+        if not rule_id:
+            errors = indigo.Dict()
+            errors["rule_id"] = "Select a rule"
+            return False, valuesDict, errors
+        rule = self.rule_store.get_rule(rule_id)
+        if rule is None:
+            errors = indigo.Dict()
+            errors["rule_id"] = f"Rule {rule_id!r} no longer exists"
+            return False, valuesDict, errors
+        desc = rule.get("description", "(no description)")
+        if action == "disable":
+            self.rule_store.update_rule(rule_id, enabled=False)
+            self.logger.info(f"Rule {rule_id} disabled via menu: {desc}")
+        elif action == "enable":
+            # Enabling also clears auto_disabled metadata so the
+            # evaluator starts fresh with a zero failure counter.
+            self.rule_store.update_rule(
+                rule_id,
+                enabled=True,
+                auto_disabled=False,
+                auto_disabled_reason=None,
+                auto_disabled_at=None,
+            )
+            self.logger.info(f"Rule {rule_id} enabled via menu: {desc}")
+        elif action == "delete":
+            self.rule_store.delete_rule(rule_id)
+            self.logger.warning(f"Rule {rule_id} deleted via menu: {desc}")
+        else:
+            errors = indigo.Dict()
+            errors["action"] = f"Unknown action {action!r}"
+            return False, valuesDict, errors
+        self._refresh_state_variables()
+        return True
 
     def menuDisableAllRules(self):
         count = self.rule_store.disable_all()
@@ -353,7 +516,52 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
 
     def handle_status(self, action, dev=None, callerWaitingForResult=None):
-        return {"status": "ok", "plugin": "home-intelligence"}
+        """Structured health snapshot of the plugin.
+
+        Returns enough operational detail for:
+          - A control-page dashboard to show "next digest at X, N
+            pending observations, M rules"
+          - MCP tools or scripts to check plugin health
+          - The user to visually confirm the plugin is doing something
+        Does NOT expose credentials or secret material. Unauthenticated
+        endpoint, so keep sensitive fields out of the response."""
+        snapshot = {
+            "status": "ok",
+            "plugin": "home-intelligence",
+            "plugin_version": self.pluginVersion,
+            "last_digest_date": self._last_digest_date.isoformat()
+                if self._last_digest_date else None,
+            "scheduled_digest_day": self.pluginPrefs.get("digestDay", "sunday"),
+            "scheduled_digest_time": self.pluginPrefs.get("digestTime", "18:00"),
+            "last_inbox_poll_at": (
+                datetime.fromtimestamp(self._last_inbox_poll_at, tz=timezone.utc).isoformat()
+                if self._last_inbox_poll_at else None
+            ),
+        }
+        # Rule and observation counts — source of truth lives in the
+        # Indigo variable stores, not cached locally.
+        if self.rule_store is not None:
+            try:
+                rules = self.rule_store.list_rules()
+                snapshot["rules_active"] = sum(
+                    1 for r in rules if r.get("enabled")
+                )
+                snapshot["rules_auto_disabled"] = sum(
+                    1 for r in rules if r.get("auto_disabled")
+                )
+                snapshot["rules_total"] = len(rules)
+            except Exception as exc:
+                snapshot["rules_error"] = str(exc)
+        if self.observation_store is not None:
+            try:
+                obs = self.observation_store.list_all()
+                snapshot["observations_total"] = len(obs)
+                snapshot["observations_pending_reply"] = sum(
+                    1 for o in obs if not o.get("user_response")
+                )
+            except Exception as exc:
+                snapshot["observations_error"] = str(exc)
+        return snapshot
 
     def handle_run_digest(self, action, dev=None, callerWaitingForResult=None):
         """Programmatic entrypoint for a digest run. Wraps DigestRunner.run
@@ -370,6 +578,16 @@ class Plugin(indigo.PluginBase):
         except Exception as exc:
             self.logger.exception(f"runDigest failed: {exc}")
             return {"status": "error", "detail": str(exc)}
+        # Digest may have added / rolled back observations; refresh
+        # the state variables so /status and Indigo variables match.
+        self._set_state_var(
+            "hi_last_digest_at",
+            datetime.now(timezone.utc).isoformat(),
+        )
+        last_cost = getattr(self.digest, "last_cost_gbp", None)
+        if last_cost is not None:
+            self._set_state_var("hi_last_digest_cost_gbp", f"{last_cost:.4f}")
+        self._refresh_state_variables()
         return {"status": "ok", "reply_id": result}
 
     def handle_feedback(self, action, dev=None, callerWaitingForResult=None):
@@ -466,6 +684,26 @@ class Plugin(indigo.PluginBase):
                     )
                 return {"status": "ok", "rule_id": None}
 
+            # Safety gate: reject rules targeting thermostats / security
+            # / locks / sensors before write. Even if the LLM proposed
+            # one (ignored its prompt) we refuse here.
+            target_id = (proposed_rule.get("then") or {}).get("device_id")
+            if not _is_safe_rule_target(target_id):
+                self.logger.warning(
+                    f"YES on {observation_id} rejected: target device "
+                    f"{target_id} is not a safe rule target "
+                    f"(thermostat / security / sensor / missing)"
+                )
+                self.observation_store.record_response(
+                    observation_id, "rejected_unsafe_target", body=body_text
+                )
+                self._send_rule_rejection(observation, target_id)
+                return {
+                    "status": "error",
+                    "detail": "unsafe_target",
+                    "target_device_id": target_id,
+                }
+
             rule_id = self.rule_store.add_rule(proposed_rule)
             if not self.observation_store.record_response(
                 observation_id, "yes", body=body_text, rule_id=rule_id
@@ -477,6 +715,10 @@ class Plugin(indigo.PluginBase):
             self.logger.info(
                 f"Created agent rule {rule_id} from YES on observation {observation_id}"
             )
+            # Confirmation email with the rule's human-readable form.
+            # Pure template — no LLM call, pennies of SMTP cost.
+            self._send_rule_confirmation(observation, rule_id, proposed_rule)
+            self._refresh_state_variables()
             return {"status": "ok", "rule_id": rule_id}
 
         if intent == "no":
@@ -485,6 +727,7 @@ class Plugin(indigo.PluginBase):
             ):
                 self.logger.warning(f"record_response failed for {observation_id} (NO)")
             self.logger.info(f"User declined observation {observation_id}")
+            self._refresh_state_variables()
             return {"status": "ok"}
 
         if intent == "snooze":
@@ -494,6 +737,7 @@ class Plugin(indigo.PluginBase):
                 self.logger.warning(
                     f"record_response failed for {observation_id} (SNOOZE)"
                 )
+            self._refresh_state_variables()
             return {"status": "ok"}
 
         # Free-text query: defer to a future digest-or-ask-Claude path.
@@ -512,6 +756,151 @@ class Plugin(indigo.PluginBase):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _send_rule_confirmation(
+        self, observation: dict, rule_id: str, rule: dict
+    ) -> None:
+        """Send a plain-template confirmation email after a YES reply
+        turns into a live rule. Pure template, no LLM call. Gives the
+        user a human-readable recap of what was written, with enough
+        context to disable it (via DISABLE reply or plugin menu)."""
+        if self.delivery is None:
+            return
+        obs_id = observation.get("id", "?")
+        headline = observation.get("headline", "Rule created")
+        description = rule.get("description", "(no description)")
+        body = (
+            f"# Rule `{rule_id}` is now active\n\n"
+            f"You accepted the observation for:\n\n"
+            f"> {headline}\n\n"
+            f"## What this rule does\n\n"
+            f"**Description:** {description}\n\n"
+            f"{_render_rule_human(rule)}\n\n"
+            f"## How to remove it\n\n"
+            f"- Reply **DISABLE** to this email, or\n"
+            f"- Use the Indigo plugin menu: Plugins > Home Intelligence "
+            f"> Disable Rule...\n\n"
+            f"---\n\n"
+            f"_Rule id: `{rule_id}` · Observation id: `{obs_id}`_\n"
+            f"_This is a templated confirmation — no LLM was called, "
+            f"no API cost._\n"
+        )
+        try:
+            self.delivery.send_email(
+                subject=f"Rule `{rule_id}` created from your YES reply",
+                body_markdown=body,
+                reply_id=obs_id,
+            )
+        except Exception as exc:
+            self.logger.exception(
+                f"Rule confirmation email failed for rule {rule_id}: {exc}"
+            )
+
+    def _send_rule_rejection(
+        self, observation: dict, target_id
+    ) -> None:
+        """Notify user that their YES reply was refused because the
+        proposed rule targets an unsafe device type. Pure template,
+        no LLM call."""
+        if self.delivery is None:
+            return
+        obs_id = observation.get("id", "?")
+        headline = observation.get("headline", "Proposed rule")
+        target_name = "unknown device"
+        if isinstance(target_id, int) and target_id in indigo.devices:
+            target_name = indigo.devices[target_id].name
+        body = (
+            f"# Rule rejected — unsafe target\n\n"
+            f"You replied YES to the observation:\n\n"
+            f"> {headline}\n\n"
+            f"The proposed rule targeted **{target_name}** (id "
+            f"`{target_id}`), which is on the plugin's allowlist of "
+            f"devices the automatic rule engine must not control "
+            f"(thermostats, security systems, locks, cameras, "
+            f"sensors without a power surface).\n\n"
+            f"**No rule has been created.** The observation is marked "
+            f"rejected; nothing has changed in your house.\n\n"
+            f"If you genuinely want this automation, create a "
+            f"standard Indigo trigger or schedule manually — those "
+            f"aren't gated.\n\n"
+            f"---\n\n"
+            f"_Observation id: `{obs_id}`_\n"
+        )
+        try:
+            self.delivery.send_email(
+                subject=f"Rule rejected (unsafe target) — obs {obs_id}",
+                body_markdown=body,
+                reply_id=obs_id,
+            )
+        except Exception as exc:
+            self.logger.exception(
+                f"Rule rejection email failed for obs {obs_id}: {exc}"
+            )
+
+    # State variables exposed to Indigo so operators can see
+    # plugin state without reading logs or calling /status. Maintained
+    # idempotently — creation is one-time, updates on every relevant
+    # event. Variable names are prefixed ``hi_`` to group them in the
+    # Indigo variable list.
+    _STATE_VARIABLES = (
+        ("hi_active_rules", "0", "Count of rules with enabled=true"),
+        ("hi_auto_disabled_rules", "0",
+         "Count of rules auto-disabled by the evaluator (target missing/failing)"),
+        ("hi_pending_observations", "0",
+         "Count of observations awaiting a user reply"),
+        ("hi_last_digest_cost_gbp", "0",
+         "Claude API cost of the most recent digest run, in GBP"),
+        ("hi_last_digest_at", "",
+         "ISO timestamp of the most recent digest run"),
+    )
+
+    def _ensure_state_variables(self) -> None:
+        """Idempotently create the hi_* variables if missing. Called
+        on startup; survives plugin restarts without duplicate writes."""
+        for name, initial, _description in self._STATE_VARIABLES:
+            if name not in indigo.variables:
+                try:
+                    indigo.variable.create(name, value=initial)
+                except Exception as exc:
+                    self.logger.warning(
+                        f"Failed to create state variable {name!r}: {exc}"
+                    )
+
+    def _refresh_state_variables(self) -> None:
+        """Update the hi_* variables from current plugin state. Safe
+        to call frequently — writes are no-ops when value unchanged.
+        Called from startup, after YES/NO feedback, and after each
+        digest run."""
+        self._ensure_state_variables()
+        try:
+            if self.rule_store is not None:
+                rules = self.rule_store.list_rules()
+                self._set_state_var(
+                    "hi_active_rules",
+                    str(sum(1 for r in rules if r.get("enabled"))),
+                )
+                self._set_state_var(
+                    "hi_auto_disabled_rules",
+                    str(sum(1 for r in rules if r.get("auto_disabled"))),
+                )
+            if self.observation_store is not None:
+                obs = self.observation_store.list_all()
+                self._set_state_var(
+                    "hi_pending_observations",
+                    str(sum(1 for o in obs if not o.get("user_response"))),
+                )
+        except Exception as exc:
+            self.logger.warning(f"State variable refresh failed: {exc}")
+
+    @staticmethod
+    def _set_state_var(name: str, value: str) -> None:
+        """Write only if value differs — avoids redundant change events
+        on Indigo's variable-change pipeline."""
+        if name not in indigo.variables:
+            return
+        current = indigo.variables[name].value
+        if current != value:
+            indigo.variable.updateValue(name, value=value)
 
     def _init_history_db(self):
         """Initialise the SQL Logger connection and log its status so the
