@@ -610,3 +610,168 @@ class TestSnapshotAll:
 
         with pytest.raises(MemoryError):
             runner._snapshot_all([SimpleNamespace(id=1, name="x")], snap, "thing")
+
+    def test_disabled_objects_are_skipped(self):
+        """Disabled triggers/schedules are dropped entirely — the digest
+        reasons about what's actively automating the house, not what the
+        user has turned off."""
+        runner = self._fake_runner()
+
+        def snap(obj, logger=None):
+            return {"id": obj.id, "name": obj.name}
+
+        result = runner._snapshot_all(
+            [
+                SimpleNamespace(id=1, name="active", enabled=True),
+                SimpleNamespace(id=2, name="disabled", enabled=False),
+                SimpleNamespace(id=3, name="also-active", enabled=True),
+            ],
+            snap,
+            "trigger",
+        )
+        names = [s["name"] for s in result]
+        assert names == ["active", "also-active"]
+
+    def test_objects_without_enabled_pass_through(self):
+        """ActionGroup in Indigo has no ``enabled`` attribute — the
+        getattr default (True) must let it through unchanged."""
+        runner = self._fake_runner()
+
+        def snap(obj, logger=None):
+            return {"id": obj.id, "name": obj.name}
+
+        result = runner._snapshot_all(
+            [SimpleNamespace(id=1, name="actiongroup-no-enabled-attr")],
+            snap,
+            "action_group",
+        )
+        assert len(result) == 1
+
+    def test_enabled_and_folderid_stripped_from_output(self):
+        """After filtering disabled, ``enabled`` is always True so it's
+        redundant; ``folderId`` is UI organisation not semantics. Both
+        are stripped from the emitted snapshot to cut prompt tokens."""
+        runner = self._fake_runner()
+
+        def snap(obj, logger=None):
+            return {
+                "id": obj.id,
+                "name": obj.name,
+                "enabled": True,
+                "folderId": 42,
+                "description": "kept",
+            }
+
+        result = runner._snapshot_all(
+            [SimpleNamespace(id=1, name="a", enabled=True)],
+            snap,
+            "trigger",
+        )
+        assert "enabled" not in result[0]
+        assert "folderId" not in result[0]
+        assert result[0]["description"] == "kept"
+
+
+# ---------------------------------------------------------------------
+# Device filter — _is_real_device
+# ---------------------------------------------------------------------
+
+
+class TestIsRealDevice:
+    """The filter that cuts 1113 devices down to ~200-300 user-recognisable
+    things. Tested via plain SimpleNamespace objects with the attributes
+    the filter checks."""
+
+    def _dev(self, **overrides):
+        # Default: a real dimmer (has `brightness`), no excluded pluginId
+        # or deviceTypeId.
+        attrs = {"pluginId": "com.example.real-plugin", "deviceTypeId": "dimmer"}
+        attrs.update(overrides)
+        ns = SimpleNamespace(**attrs)
+        # Add capability attrs via dynamic setattr so hasattr() works.
+        # Callers can override by passing a capability=False to strip one.
+        for cap in ("brightness", "onState", "temperatureInputs", "sensorValue"):
+            if cap not in attrs:
+                continue
+            if attrs[cap] is False:
+                # Explicit request to strip this capability.
+                delattr(ns, cap)
+        return ns
+
+    def test_dimmer_is_real(self):
+        dev = self._dev(brightness=80)
+        assert DigestRunner._is_real_device(dev) is True
+
+    def test_relay_is_real(self):
+        dev = SimpleNamespace(
+            pluginId="com.example.shelly", deviceTypeId="relay", onState=True
+        )
+        assert DigestRunner._is_real_device(dev) is True
+
+    def test_thermostat_is_real(self):
+        dev = SimpleNamespace(
+            pluginId="com.example.heatmiser",
+            deviceTypeId="thermostat",
+            temperatureInputs=[20.0],
+        )
+        assert DigestRunner._is_real_device(dev) is True
+
+    def test_sensor_is_real(self):
+        dev = SimpleNamespace(
+            pluginId="com.example.zwave",
+            deviceTypeId="sensor",
+            sensorValue=22.5,
+        )
+        assert DigestRunner._is_real_device(dev) is True
+
+    def test_alexa_mirror_is_excluded(self):
+        # Alexa Hue Bridge exposes a "real"-looking dimmer, but it's a
+        # mirror of another device. Drop by pluginId.
+        dev = SimpleNamespace(
+            pluginId="com.indigodomo.opensource.alexa-hue-bridge",
+            deviceTypeId="dimmer",
+            brightness=80,
+        )
+        assert DigestRunner._is_real_device(dev) is False
+
+    def test_homekit_mirror_is_excluded(self):
+        dev = SimpleNamespace(
+            pluginId="com.GlennNZ.indigoplugin.HomeKitLink-Siri",
+            deviceTypeId="relay",
+            onState=True,
+        )
+        assert DigestRunner._is_real_device(dev) is False
+
+    def test_virtual_device_collection_is_excluded(self):
+        dev = SimpleNamespace(
+            pluginId="com.perceptiveautomation.indigoplugin.devicecollection",
+            deviceTypeId="computed",
+            onState=True,
+        )
+        assert DigestRunner._is_real_device(dev) is False
+
+    def test_shelly_button_child_is_excluded(self):
+        # Shelly primary switches expose deviceTypeId="component-switch"
+        # (kept). The button children expose "component-button" — drop.
+        dev = SimpleNamespace(
+            pluginId="com.lionsheeptechnology.ShellyNGMQTT",
+            deviceTypeId="component-button",
+            onState=False,
+        )
+        assert DigestRunner._is_real_device(dev) is False
+
+    def test_plain_virtual_device_without_capability_is_excluded(self):
+        # Device slipping past plugin-id/type-id filters but having no
+        # real surface should still be rejected.
+        dev = SimpleNamespace(
+            pluginId="com.example.mystery",
+            deviceTypeId="whatever",
+        )
+        assert DigestRunner._is_real_device(dev) is False
+
+    def test_missing_attributes_default_sensibly(self):
+        # A bare object with no pluginId/deviceTypeId but a real capability
+        # should be kept (getattr defaults to "" which isn't in either
+        # exclusion list).
+        dev = SimpleNamespace(brightness=100)
+        assert DigestRunner._is_real_device(dev) is True

@@ -317,18 +317,83 @@ class DigestRunner:
             return {}
         return {str(did): body for did, body in rollups.items()}
 
+    # Plugins whose "devices" are mirrors/virtual/UI-only — exclude
+    # wholesale so Claude doesn't see every real light twice (once as
+    # the Shelly, once as the HomeKit mirror). These are Simon's house
+    # specifically; if this plugin gains other users we'd want this
+    # configurable.
+    _EXCLUDE_PLUGIN_IDS = frozenset(
+        {
+            "com.indigodomo.opensource.alexa-hue-bridge",
+            "com.GlennNZ.indigoplugin.HomeKitLink-Siri",
+            "com.perceptiveautomation.indigoplugin.devicecollection",
+        }
+    )
+
+    # deviceTypeIds that are sub-widgets of a primary device (Shelly
+    # button children, input children, on-board CPU-temperature sensor
+    # that ships with every relay). We keep the primary switch/relay and
+    # drop the kids.
+    _EXCLUDE_DEVICE_TYPE_IDS = frozenset(
+        {
+            "component-button",
+            "component-input",
+            "component-temperature-onboard",
+        }
+    )
+
+    @classmethod
+    def _is_real_device(cls, dev) -> bool:
+        """Return True for devices that represent a real, user-recognisable
+        thing in the house: lights, switches, TRVs, thermostats, sensors,
+        power meters, contact sensors. Drop mirrors (Alexa / HomeKit),
+        virtual device collections, and sub-widget components."""
+        plugin_id = getattr(dev, "pluginId", "") or ""
+        if plugin_id in cls._EXCLUDE_PLUGIN_IDS:
+            return False
+        type_id = getattr(dev, "deviceTypeId", "") or ""
+        if type_id in cls._EXCLUDE_DEVICE_TYPE_IDS:
+            return False
+        # Capability gate: must expose at least one of the real device
+        # surfaces. Drops pure-virtual plugin devices that slipped past
+        # the plugin-ID list above.
+        return (
+            hasattr(dev, "brightness")            # dimmers (lights)
+            or hasattr(dev, "onState")            # relays, TRV switches, outlets
+            or hasattr(dev, "temperatureInputs")  # thermostats
+            or hasattr(dev, "sensorValue")        # temp/humidity/motion
+        )
+
     def _build_house_model(self) -> dict:
+        """Build the static house-shape block of the digest prompt.
+
+        Filters applied:
+
+        - Devices: only "real" devices (see ``_is_real_device``) that are
+          enabled. Dropping sub-components and mirrors is the biggest
+          single cache-write saving on Simon's 1113-device house (~70%
+          of the raw count is noise).
+        - Triggers / schedules: only those with ``enabled=True``. The
+          ``enabled`` key is stripped from the emitted snapshot (always
+          true after filtering, so redundant).
+        - Action groups: no enabled attribute in Indigo, pass through.
+        - ``folderId`` is stripped from triggers/schedules/action-groups
+          since the folder is a UI convenience; Claude reasons from names
+          and descriptions. Devices keep ``folder_id`` so per-room
+          grouping survives via ``device_folders``."""
         devices = []
         for dev in indigo.devices:
-            room = getattr(dev, "folderId", None)
+            if not self._is_real_device(dev):
+                continue
+            if not bool(getattr(dev, "enabled", True)):
+                continue
             devices.append(
                 {
                     "id": dev.id,
                     "name": dev.name,
                     "type": self._device_type_label(dev),
                     "model": getattr(dev, "model", "") or "",
-                    "folder_id": room,
-                    "enabled": bool(getattr(dev, "enabled", True)),
+                    "folder_id": getattr(dev, "folderId", None),
                 }
             )
 
@@ -409,12 +474,24 @@ class DigestRunner:
     def _snapshot_all(self, iterable, snapshot_fn, label: str) -> List[dict]:
         """Iterate an `indigo.*` collection and build snapshots with
         per-object isolation: one broken object degrades to a stub and
-        a warning, the rest keep full fidelity. Returns the list in
-        original order."""
+        a warning, the rest keep full fidelity.
+
+        Two post-filters applied to reduce cached-block size:
+
+        - Disabled objects (``enabled=False``) are skipped. Action groups
+          have no ``enabled`` attribute, so the ``getattr(..., True)``
+          default passes them through unchanged.
+        - ``enabled`` and ``folderId`` keys are stripped from the emitted
+          snapshot. After the disabled filter ``enabled`` is always True
+          (so redundant); ``folderId`` is UI organisation not semantics.
+
+        Returns the list in original order, minus filtered-out objects."""
         out = []
         for obj in iterable:
+            if not bool(getattr(obj, "enabled", True)):
+                continue
             try:
-                out.append(snapshot_fn(obj, logger=self.logger))
+                snapshot = snapshot_fn(obj, logger=self.logger)
             except (MemoryError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
@@ -427,6 +504,10 @@ class DigestRunner:
                 out.append(
                     {"id": obj_id, "name": obj_name, "_snapshot_error": str(exc)}
                 )
+                continue
+            snapshot.pop("enabled", None)
+            snapshot.pop("folderId", None)
+            out.append(snapshot)
         return out
 
     @classmethod
