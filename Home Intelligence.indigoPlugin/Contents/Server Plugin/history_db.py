@@ -44,14 +44,18 @@ class HistoryDB:
         }
 
     # Recognisable fragments of psql stderr mapped to an actionable
-    # one-liner. Matched on lowercased stderr; the first hit wins so
-    # order the most-specific patterns first.
+    # one-liner. Matched on lowercased stderr; the first hit wins, so
+    # specific patterns MUST precede generic ones. In particular
+    # ``does not exist`` is a substring of BOTH
+    # ``role "X" does not exist`` AND ``database "Y" does not exist`` —
+    # if the generic "does not exist" rule matched first, database
+    # errors would be misclassified as role errors.
     _PG_ERROR_HINTS = (
-        ("does not exist", "role (user) not found in Postgres — check 'Postgres user' field in Plugin Configure (case-sensitive)"),
         ("password authentication failed", "wrong password — check 'Postgres password' in Plugin Configure"),
         ("connection refused", "Postgres isn't accepting connections on this host/port — is Postgres.app running?"),
         ("could not translate host name", "hostname didn't resolve — check 'Postgres host' in Plugin Configure"),
         ("database \"", "database doesn't exist — check 'Postgres database' in Plugin Configure"),
+        ("does not exist", "role (user) not found in Postgres — check 'Postgres user' field in Plugin Configure (case-sensitive)"),
     )
 
     def _diagnose_pg_error(self, stderr: str) -> str:

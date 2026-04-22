@@ -63,10 +63,10 @@ The event log is delivered in two fenced code blocks in the user message:
   (``total_events``, ``top_sources``, ``events_by_hour``,
   ``sql_logger_rollups``).
 - ``event_log_timeline`` — JSON-lines, chronological, one **positional
-  array** per line with the shape ``["MM-DD HH:MM:SS", source, message]``.
-  The year is always the current year (shown in the digest window
-  header). Milliseconds are omitted. Multi-line tracebacks inside
-  ``message`` appear as escaped ``\\n`` inside the string.
+  array** per line with the shape
+  ``["YYYY-MM-DD HH:MM:SS", source, message]``. Milliseconds are
+  omitted. Multi-line tracebacks inside ``message`` appear as escaped
+  ``\\n`` inside the string.
 
 REASONING OVER THE EVENT LOG
 You are given the last 7 days of Indigo event log narrations alongside
@@ -268,6 +268,14 @@ class DigestRunner:
             )
             return None
 
+        # Soft-warn on narrative-shape drift. A slightly-off-shape digest
+        # is still worth delivering — the schema is already enforced
+        # above; the shape checks are about prompt adherence, not
+        # correctness. Logging at warning keeps drift visible without
+        # dropping the week's digest.
+        for shape_warning in self._shape_warnings(parsed):
+            self.logger.warning(f"Digest shape: {shape_warning}")
+
         return self._deliver(parsed, usage, cost_gbp)
 
     # ------------------------------------------------------------------
@@ -318,12 +326,14 @@ class DigestRunner:
         embedded newlines are escaped as ``\\n`` inside the JSON string."""
         local_now = now.astimezone()
         summary_block = json.dumps(event_summary, separators=(',', ':'))
-        # Timestamp slicing: "2026-04-22 07:37:42.510"[5:19] -> "04-22 07:37:42"
-        # drops year (implicit from the digest window) and milliseconds
-        # (not load-bearing at weekly resolution).
+        # Timestamp slicing: "2026-04-22 07:37:42.510"[:19] -> "2026-04-22 07:37:42"
+        # Drops milliseconds (not load-bearing at weekly resolution) but
+        # keeps the year — digest windows can cross New Year (e.g. a run
+        # on 4 Jan covers 28 Dec - 4 Jan) and a year-less "MM-DD" timestamp
+        # would sort wrongly across the boundary.
         timeline_lines = [
             json.dumps(
-                [e["timestamp"][5:19], e["source"], e["message"]],
+                [e["timestamp"][:19], e["source"], e["message"]],
                 separators=(',', ':'),
             )
             for e in events
@@ -340,9 +350,10 @@ class DigestRunner:
             f"{summary_block}\n"
             "```\n\n"
             "EVENT LOG TIMELINE (JSON-lines positional arrays, "
-            "chronological — schema: [\"MM-DD HH:MM:SS\", source, message]; "
-            "year is the current year; multi-line tracebacks in the "
-            "message field survive as escaped \\n)\n"
+            "chronological — schema: "
+            "[\"YYYY-MM-DD HH:MM:SS\", source, message]; "
+            "multi-line tracebacks in the message field survive as "
+            "escaped \\n)\n"
             "```event_log_timeline\n"
             f"{timeline_block}\n"
             "```\n\n"
@@ -771,6 +782,40 @@ class DigestRunner:
     # ------------------------------------------------------------------
 
     _ALLOWED_RULE_OPS = {"on", "off", "toggle", "set_brightness"}
+
+    @classmethod
+    def _shape_warnings(cls, parsed: dict) -> List[str]:
+        """Check the parsed output against the pinned narrative shape in
+        INSTRUCTIONS: ``Week of ...`` subject prefix, ``## ``
+        weekly-status heading, and (when an observation is flagged)
+        both ``### What caught my eye`` and ``### The inference``
+        sections.
+
+        Returns a list of warning strings, empty if the shape is fine.
+        Non-blocking — the caller logs these but still delivers the
+        digest. Blocking validation lives in ``_validate_parsed``."""
+        warnings: List[str] = []
+        subject = parsed.get("subject", "") or ""
+        if not subject.startswith("Week of "):
+            warnings.append(
+                f"subject missing 'Week of' prefix: {subject[:80]!r}"
+            )
+
+        narrative = parsed.get("narrative_markdown", "") or ""
+        if "## " not in narrative:
+            warnings.append("narrative_markdown missing any '## ' heading")
+
+        observation = parsed.get("observation")
+        if isinstance(observation, dict):
+            if "### What caught my eye" not in narrative:
+                warnings.append(
+                    "narrative_markdown missing '### What caught my eye' section"
+                )
+            if "### The inference" not in narrative:
+                warnings.append(
+                    "narrative_markdown missing '### The inference' section"
+                )
+        return warnings
 
     @classmethod
     def _validate_parsed(cls, parsed: object) -> Optional[str]:

@@ -107,3 +107,89 @@ class TestValidateParsed:
             payload = self._valid_with_rule()
             payload["observation"]["proposed_rule"]["then"]["op"] = op
             assert DigestRunner._validate_parsed(payload) is None, f"op={op} rejected"
+
+
+class TestShapeWarnings:
+    """The soft shape-check that runs after _validate_parsed. Detects
+    narrative drift from the pinned template in INSTRUCTIONS but never
+    blocks delivery — a slightly-off digest is better than no digest."""
+
+    _WELL_FORMED_OBSERVATION = {
+        "subject": "Week of 15-22 Apr: Dining TRV issues",
+        "narrative_markdown": (
+            "## This week in the house\n\n"
+            "Everything ran smoothly except one thing.\n\n"
+            "### What caught my eye\n\n"
+            "The Dining TRV kept dropping off the network.\n\n"
+            "### The inference\n\n"
+            "This could affect Cat's WFH heating schedule."
+        ),
+        "observation": {
+            "headline": "Dining TRV unreliable",
+            "rationale": "Offline repeatedly across the week.",
+            "related_devices": [123],
+            "proposed_rule": None,
+        },
+    }
+
+    def test_well_formed_observation_no_warnings(self):
+        assert DigestRunner._shape_warnings(self._WELL_FORMED_OBSERVATION) == []
+
+    def test_well_formed_quiet_week_no_warnings(self):
+        payload = {
+            "subject": "Week of 15-22 Apr: quiet week, everything healthy",
+            "narrative_markdown": (
+                "## Quiet week in the house\n\n"
+                "No leaks, no alarms, no outages.\n\n"
+                "Heating and lighting all behaved as configured."
+            ),
+            "observation": None,
+        }
+        assert DigestRunner._shape_warnings(payload) == []
+
+    def test_subject_without_week_of_prefix_warns(self):
+        payload = dict(self._WELL_FORMED_OBSERVATION)
+        payload["subject"] = "Weekly digest for April"
+        warnings = DigestRunner._shape_warnings(payload)
+        assert any("Week of" in w for w in warnings)
+
+    def test_narrative_missing_any_heading_warns(self):
+        payload = dict(self._WELL_FORMED_OBSERVATION)
+        payload["narrative_markdown"] = "Just a flat paragraph, no headings."
+        warnings = DigestRunner._shape_warnings(payload)
+        assert any("'## '" in w for w in warnings)
+
+    def test_observation_missing_what_caught_my_eye_warns(self):
+        payload = dict(self._WELL_FORMED_OBSERVATION)
+        payload["narrative_markdown"] = (
+            "## This week\n\nPrelude.\n\n"
+            "### The inference\n\nAnalysis."
+        )
+        warnings = DigestRunner._shape_warnings(payload)
+        assert any("What caught my eye" in w for w in warnings)
+
+    def test_observation_missing_the_inference_warns(self):
+        payload = dict(self._WELL_FORMED_OBSERVATION)
+        payload["narrative_markdown"] = (
+            "## This week\n\nPrelude.\n\n"
+            "### What caught my eye\n\nDescription."
+        )
+        warnings = DigestRunner._shape_warnings(payload)
+        assert any("The inference" in w for w in warnings)
+
+    def test_quiet_week_narrative_doesnt_need_observation_sections(self):
+        # observation=None means no '### What caught my eye' /
+        # '### The inference' required; the opening '## ' heading is
+        # still required though.
+        payload = {
+            "subject": "Week of 1-8 Feb: quiet",
+            "narrative_markdown": "## Calm week\n\nAll good.",
+            "observation": None,
+        }
+        assert DigestRunner._shape_warnings(payload) == []
+
+    def test_empty_subject_warns(self):
+        payload = dict(self._WELL_FORMED_OBSERVATION)
+        payload["subject"] = ""
+        warnings = DigestRunner._shape_warnings(payload)
+        assert any("Week of" in w for w in warnings)

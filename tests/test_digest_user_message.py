@@ -66,17 +66,37 @@ class TestBuildUserMessage:
         assert json.loads(summary_body) == summary
 
         # Timeline is one JSON *array* per line with positional fields
-        # ["MM-DD HH:MM:SS", source, message]. Year and milliseconds are
-        # sliced off the timestamp for token efficiency.
+        # ["YYYY-MM-DD HH:MM:SS", source, message]. Milliseconds are
+        # sliced off for token efficiency; year is kept so windows that
+        # span New Year (e.g. late-December → early-January run) sort
+        # correctly.
         timeline_body = _parse_fenced_block(message, "event_log_timeline")
         lines = timeline_body.split("\n")
         assert len(lines) == len(events)
         for line, original in zip(lines, events):
             arr = json.loads(line)
             assert isinstance(arr, list) and len(arr) == 3
-            assert arr[0] == original["timestamp"][5:19]
+            assert arr[0] == original["timestamp"][:19]
             assert arr[1] == original["source"]
             assert arr[2] == original["message"]
+
+    def test_timeline_preserves_year_across_new_year(self):
+        """Digest window can span 31 Dec / 1 Jan. Year-less timestamps
+        would sort wrongly (01-02 before 12-31). Full-year timestamps
+        are chronologically comparable."""
+        runner = _runner()
+        now = datetime(2026, 1, 4, 10, 0, tzinfo=timezone.utc)
+        since = now - timedelta(days=7)
+        events = [
+            {"timestamp": "2025-12-29 10:00:00.000", "source": "Trigger", "message": "old year"},
+            {"timestamp": "2026-01-02 10:00:00.000", "source": "Trigger", "message": "new year"},
+        ]
+        summary = {"total_events": 2, "top_sources": {}, "events_by_hour": {}, "sql_logger_rollups": {}}
+        message = runner._build_user_message(now, since, 7, events, summary)
+        timeline_body = _parse_fenced_block(message, "event_log_timeline")
+        lines = timeline_body.split("\n")
+        assert json.loads(lines[0])[0] == "2025-12-29 10:00:00"
+        assert json.loads(lines[1])[0] == "2026-01-02 10:00:00"
 
     def test_timeline_is_compact_no_indent(self):
         """Compact JSON (no whitespace between tokens) — avoids paying
