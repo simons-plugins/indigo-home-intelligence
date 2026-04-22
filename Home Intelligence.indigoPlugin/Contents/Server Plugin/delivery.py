@@ -116,6 +116,11 @@ class DeliveryClient:
             msg["X-HI-Reply-Id"] = reply_id
         else:
             msg["Message-ID"] = email.utils.make_msgid(domain=domain)
+        # Tag outgoing digest so the inbox poller can distinguish our
+        # own outgoing mail (which lands back in the same inbox when
+        # SMTP sender == IMAP user) from genuine user replies.
+        # See inbox.py `_extract_reply_id` for the matching skip.
+        msg["X-HI-Digest-Source"] = "1"
         msg.set_content(body_markdown)
 
         error = self._send_smtp(msg, recipient)

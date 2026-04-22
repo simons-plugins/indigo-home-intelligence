@@ -12,6 +12,24 @@
         <Name>Show Observations</Name>
         <CallbackMethod>menuShowObservations</CallbackMethod>
     </MenuItem>
+    <MenuItem id="manageRule">
+        <Name>Manage Rule...</Name>
+        <CallbackMethod>menuManageRule</CallbackMethod>
+        <ConfigUI>
+            <Field id="rule_id" type="menu">
+                <Label>Rule:</Label>
+                <List class="self" method="menuManageRuleRuleList"/>
+            </Field>
+            <Field id="action" type="menu" defaultValue="disable">
+                <Label>Action:</Label>
+                <List>
+                    <Option value="disable">Disable (stop enforcing, keep record)</Option>
+                    <Option value="enable">Enable (resume enforcing)</Option>
+                    <Option value="delete">Delete (remove entirely)</Option>
+                </List>
+            </Field>
+        </ConfigUI>
+    </MenuItem>
     <MenuItem id="disableAllRules">
         <Name>Disable All Agent Rules</Name>
         <CallbackMethod>menuDisableAllRules</CallbackMethod>

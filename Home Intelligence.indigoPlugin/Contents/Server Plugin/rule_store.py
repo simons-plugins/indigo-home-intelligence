@@ -174,3 +174,17 @@ class RuleStore:
             fires_count=(self.get_rule(rule_id) or {}).get("fires_count", 0) + 1,
             last_fired_at=datetime.now(timezone.utc).isoformat(),
         )
+
+    def auto_disable(self, rule_id: str, reason: str) -> bool:
+        """Mark a rule as auto-disabled by the evaluator (target device
+        missing, state key renamed, action failing). Records the reason
+        and timestamp so the weekly digest can surface the auto-disabled
+        rule in its roundup, and the user can see WHY in the Indigo
+        variable editor."""
+        return self.update_rule(
+            rule_id,
+            enabled=False,
+            auto_disabled=True,
+            auto_disabled_reason=reason,
+            auto_disabled_at=datetime.now(timezone.utc).isoformat(),
+        )

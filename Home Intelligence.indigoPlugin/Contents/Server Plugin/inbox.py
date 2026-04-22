@@ -233,6 +233,14 @@ class InboxPoller:
         raw = msg_data[0][1]
         msg = email.message_from_bytes(raw)
 
+        # Skip the plugin's own outgoing digests — they loop back into
+        # the inbox when SMTP sender and IMAP user are the same
+        # address. Delivery tags each outgoing message with
+        # X-HI-Digest-Source: 1; a genuine user reply won't carry that
+        # header (clients don't echo custom headers on reply).
+        if msg.get("X-HI-Digest-Source"):
+            return False
+
         reply_id = self._extract_reply_id(msg)
         if not reply_id:
             # Not a digest reply; leave untouched so the user still sees it.

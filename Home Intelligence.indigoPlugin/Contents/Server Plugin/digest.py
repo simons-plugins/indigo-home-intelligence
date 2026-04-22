@@ -100,6 +100,23 @@ The event log is delivered in two fenced code blocks in the user message:
   omitted. Multi-line tracebacks inside ``message`` appear as escaped
   ``\\n`` inside the string.
 
+AUTO-DISABLED RULES
+The plugin's rule evaluator auto-disables a rule when it can't
+evaluate it (target device deleted, state key renamed by a plugin
+upgrade) or when its action keeps failing. Each such rule carries
+``enabled: false`` plus ``auto_disabled: true``,
+``auto_disabled_reason``, and ``auto_disabled_at`` in the EXISTING
+AGENT RULES block.
+
+When you find auto-disabled rules, mention them in the opening
+weekly-status paragraph with the reason — the user accepted them
+once and needs to know they've stopped working. Suggested phrasing:
+"One rule (`a524f4a5` — coffee machine auto-off) was auto-disabled
+on 2026-04-21 because the target device has been removed. Worth
+re-creating or deleting if you restructured your plugs." Don't
+propose a new rule to replace them in the same digest — raise the
+awareness first, let the user decide.
+
 REASONING OVER THE EVENT LOG
 You are given the last 7 days of Indigo event log narrations alongside
 the static house model. Use them to understand what ACTUALLY happens,
@@ -138,6 +155,24 @@ RULE SCHEMA (the shape `observation.proposed_rule` must match, when non-null)
       "value": <int> | null                 // only for set_brightness
     }
   }
+
+RULE TARGETING ALLOWLIST
+The `then.device_id` MUST be a "controllable power" device — a dimmer,
+relay, or smart plug. Do NOT propose rules that target:
+- Thermostats (setpoint changes are high-stakes; user changes manually)
+- Security systems, alarm panels, door locks (safety-critical)
+- Sensors without a power surface (nothing to switch on/off)
+- Cameras, AV receivers, or irrigation controllers (non-standard ops)
+
+Concretely: the target device must expose `brightness` (dimmer) or
+`onState` (relay/plug). It must NOT have `temperatureInputs`
+(thermostat). Look at the device `type` field in the HOUSE MODEL
+block: only `dimmer` and `relay` types are valid targets.
+
+If the pattern you spotted really needs a non-controllable target
+(e.g. "when the front door is left open for 20 minutes → set the
+thermostat down"), describe the insight in the observation rationale
+but set `proposed_rule: null`. The user can then act manually.
 
 OUTPUT FORMAT
 Return ONLY a single JSON object. No markdown code fences. No preamble.
@@ -231,6 +266,11 @@ class DigestRunner:
         self.offline_hours_threshold = offline_hours_threshold
         self.client = AnthropicClient(api_key=api_key, model=model, logger=logger)
         self.event_log = EventLogReader(logger=logger)
+        # Populated by run() after each Claude call; None before the
+        # first run. Read by plugin.py to maintain the
+        # hi_last_digest_cost_gbp state variable.
+        self.last_cost_gbp: Optional[float] = None
+        self.last_usage: Optional[dict] = None
 
     # ------------------------------------------------------------------
     # Entry point
@@ -285,6 +325,9 @@ class DigestRunner:
 
         usage = self.client.extract_usage(response)
         cost_gbp = self.client.estimate_cost_gbp(usage, self.model)
+        # Expose for the plugin's state-variable refresh after run.
+        self.last_cost_gbp = cost_gbp
+        self.last_usage = usage
         self.logger.info(
             f"Digest usage: in={usage['input_tokens']} out={usage['output_tokens']} "
             f"cache_read={usage['cache_read_input_tokens']} "
@@ -430,40 +473,59 @@ class DigestRunner:
         low_batteries: List[dict] = []
         offline_devices: List[dict] = []
         for dev in indigo.devices:
-            if not bool(getattr(dev, "enabled", True)):
-                continue
-            battery = getattr(dev, "batteryLevel", None)
-            if battery is not None and battery <= self.battery_low_threshold:
-                low_batteries.append(
-                    {"id": dev.id, "name": dev.name, "battery_pct": battery}
-                )
-            error_state = getattr(dev, "errorState", "") or ""
-            last_comm = getattr(dev, "lastSuccessfulComm", None)
-            hours_offline: Optional[float] = None
-            if last_comm is not None:
-                try:
-                    # lastSuccessfulComm is a tz-naive datetime in
-                    # Indigo's local timezone. Coerce comparison via a
-                    # naive now-local.
-                    now_naive = now.replace(tzinfo=None)
-                    hours_offline = round(
-                        (now_naive - last_comm).total_seconds() / 3600, 1
+            # Per-device isolation: one malformed device (attribute
+            # raise, plugin stale state) must NOT kill the whole
+            # fleet-health block and therefore skip the weekly digest.
+            # Matches the pattern used in _snapshot_all.
+            try:
+                if not bool(getattr(dev, "enabled", True)):
+                    continue
+                battery = getattr(dev, "batteryLevel", None)
+                if battery is not None and battery <= self.battery_low_threshold:
+                    low_batteries.append(
+                        {"id": dev.id, "name": dev.name, "battery_pct": battery}
                     )
-                except Exception:
-                    hours_offline = None
-            is_offline = bool(error_state) or (
-                hours_offline is not None
-                and hours_offline > self.offline_hours_threshold
-            )
-            if is_offline:
-                offline_devices.append(
-                    {
-                        "id": dev.id,
-                        "name": dev.name,
-                        "error_state": error_state or None,
-                        "hours_offline": hours_offline,
-                    }
+                error_state = getattr(dev, "errorState", "") or ""
+                last_comm = getattr(dev, "lastSuccessfulComm", None)
+                hours_offline: Optional[float] = None
+                if last_comm is not None:
+                    try:
+                        # lastSuccessfulComm is a tz-naive datetime in
+                        # Indigo's local timezone. Coerce comparison via a
+                        # naive now-local.
+                        now_naive = now.replace(tzinfo=None)
+                        hours_offline = round(
+                            (now_naive - last_comm).total_seconds() / 3600, 1
+                        )
+                    except Exception as exc:
+                        self.logger.debug(
+                            f"Fleet health: lastSuccessfulComm delta failed "
+                            f"for {dev.id}: {exc}"
+                        )
+                        hours_offline = None
+                is_offline = bool(error_state) or (
+                    hours_offline is not None
+                    and hours_offline > self.offline_hours_threshold
                 )
+                if is_offline:
+                    offline_devices.append(
+                        {
+                            "id": dev.id,
+                            "name": dev.name,
+                            "error_state": error_state or None,
+                            "hours_offline": hours_offline,
+                        }
+                    )
+            except (MemoryError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                obj_id = getattr(dev, "id", "?")
+                obj_name = getattr(dev, "name", "?")
+                self.logger.warning(
+                    f"Fleet health: skipping device id={obj_id} "
+                    f"name={obj_name!r}: {exc}"
+                )
+                continue
         # Cap each list at 30 entries; more than that and the digest
         # prompt ballooning matters more than naming every single one.
         # Claude can still say "and 14 others" from the total count.
