@@ -534,6 +534,30 @@ class Plugin(indigo.PluginBase):
 
         if self.history_db.test_connection():
             self.logger.info(f"SQL Logger ready: {target}")
+            # One-shot startup rollup dry-run — lets us validate the
+            # energy rollup query returns sensible counts without
+            # firing a digest (each digest costs real money through
+            # Claude). Safe to leave in; it's one DB query.
+            try:
+                ids = self.history_db.discover_energy_tables()
+                if ids:
+                    rollup = self.history_db.energy_rollup_14d(ids)
+                    name_lookup = {dev.id: dev.name for dev in indigo.devices}
+                    this_week_only = sorted(
+                        did for did, d in rollup.items()
+                        if d.get("last_week_kwh") is None
+                    )
+                    if this_week_only:
+                        labelled = [
+                            f"{did}={name_lookup.get(did, '?')!r}"
+                            for did in this_week_only
+                        ]
+                        self.logger.info(
+                            f"Rollup this-week-only (no 14d baseline, "
+                            f"{len(this_week_only)}): {labelled}"
+                        )
+            except Exception as exc:
+                self.logger.warning(f"Rollup dry-run failed: {exc}")
         else:
             self.logger.warning(
                 f"SQL Logger unavailable: {target}. Digest will run "

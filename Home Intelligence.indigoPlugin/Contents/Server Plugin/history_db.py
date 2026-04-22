@@ -491,29 +491,32 @@ class HistoryDB:
 
         # Build one UNION ALL query: one row per device with three
         # scalar-subquery columns (now, -7d, -14d).
+        #
+        # IMPORTANT: ``WHERE accumEnergyTotal IS NOT NULL`` on each
+        # subquery. SQL Logger writes a row for every device state
+        # change, but not every row has every column populated — a
+        # smart plug's most recent row is likely its last on/off
+        # toggle, which may not carry an accumEnergyTotal value.
+        # Without the IS NOT NULL filter, most devices return NULL
+        # from the latest row and get dropped despite having plenty
+        # of historical kWh data in earlier rows.
         parts = []
         for did in valid_ids:
             table = f'"device_history_{did}"'
-            if self.db_type == "sqlite":
-                parts.append(
-                    f"SELECT {did} AS id, "
-                    f"(SELECT accumEnergyTotal FROM {table} "
-                    f"ORDER BY ts DESC LIMIT 1) AS now_v, "
-                    f"(SELECT accumEnergyTotal FROM {table} "
-                    f"WHERE ts <= '{week_ago_ts}' ORDER BY ts DESC LIMIT 1) AS w1, "
-                    f"(SELECT accumEnergyTotal FROM {table} "
-                    f"WHERE ts <= '{two_weeks_ago_ts}' ORDER BY ts DESC LIMIT 1) AS w2"
-                )
-            else:
-                parts.append(
-                    f"SELECT {did} AS id, "
-                    f"(SELECT accumEnergyTotal FROM {table} "
-                    f"ORDER BY ts DESC LIMIT 1) AS now_v, "
-                    f"(SELECT accumEnergyTotal FROM {table} "
-                    f"WHERE ts <= '{week_ago_ts}' ORDER BY ts DESC LIMIT 1) AS w1, "
-                    f"(SELECT accumEnergyTotal FROM {table} "
-                    f"WHERE ts <= '{two_weeks_ago_ts}' ORDER BY ts DESC LIMIT 1) AS w2"
-                )
+            parts.append(
+                f"SELECT {did} AS id, "
+                f"(SELECT accumEnergyTotal FROM {table} "
+                f"WHERE accumEnergyTotal IS NOT NULL "
+                f"ORDER BY ts DESC LIMIT 1) AS now_v, "
+                f"(SELECT accumEnergyTotal FROM {table} "
+                f"WHERE accumEnergyTotal IS NOT NULL "
+                f"AND ts <= '{week_ago_ts}' "
+                f"ORDER BY ts DESC LIMIT 1) AS w1, "
+                f"(SELECT accumEnergyTotal FROM {table} "
+                f"WHERE accumEnergyTotal IS NOT NULL "
+                f"AND ts <= '{two_weeks_ago_ts}' "
+                f"ORDER BY ts DESC LIMIT 1) AS w2"
+            )
         sql = " UNION ALL ".join(parts)
 
         try:
@@ -584,6 +587,51 @@ class HistoryDB:
             f"queried {len(valid_ids)}"
         )
         return out
+
+    def diagnose_energy_columns(self):
+        """One-shot schema diagnostic: enumerate every column across all
+        ``device_history_*`` tables whose name hints at energy/power
+        measurement, and log how many devices have each. Lets the
+        operator see exactly which column names SQL Logger is using
+        for energy on THIS install — rather than assuming the standard
+        ``accumEnergyTotal`` is present everywhere."""
+        if self.db_type != "postgresql":
+            return
+        sql = (
+            "SELECT column_name, COUNT(DISTINCT table_name) AS device_count "
+            "FROM information_schema.columns "
+            "WHERE table_schema = 'public' "
+            "AND table_name LIKE 'device_history_%' "
+            "AND ("
+            "  LOWER(column_name) LIKE '%energy%' "
+            "  OR LOWER(column_name) LIKE '%power%' "
+            "  OR LOWER(column_name) LIKE '%kwh%' "
+            "  OR LOWER(column_name) LIKE '%watt%' "
+            "  OR LOWER(column_name) LIKE '%usage%' "
+            "  OR LOWER(column_name) LIKE '%consumption%' "
+            "  OR LOWER(column_name) LIKE '%meter%' "
+            ") "
+            "GROUP BY column_name "
+            "ORDER BY device_count DESC, column_name"
+        )
+        try:
+            _, rows = self._execute(sql)
+        except Exception as exc:
+            self.logger.warning(f"Energy column diagnosis failed: {exc}")
+            return
+        if not rows:
+            self.logger.info("Energy column diagnosis: no matching columns")
+            return
+        self.logger.info(
+            f"Energy column diagnosis: {len(rows)} candidate column(s)"
+        )
+        for row in rows:
+            col = row[0]
+            try:
+                count = int(row[1])
+            except (TypeError, ValueError):
+                count = 0
+            self.logger.info(f"  '{col}': {count} device(s)")
 
     def close(self):
         """No persistent connections to close (SQLite opens per-query, PG uses psql CLI)."""
