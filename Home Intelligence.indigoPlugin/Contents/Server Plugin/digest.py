@@ -56,6 +56,18 @@ GOALS
 - Never re-suggest something the owner has already declined or that is
   already automated by an existing trigger, schedule, or agent rule.
 
+EVENT LOG FORMAT
+The event log is delivered in two fenced code blocks in the user message:
+
+- ``event_log_summary`` — one compact JSON object with aggregate counts
+  (``total_events``, ``top_sources``, ``events_by_hour``,
+  ``sql_logger_rollups``).
+- ``event_log_timeline`` — JSON-lines, chronological, one **positional
+  array** per line with the shape ``["MM-DD HH:MM:SS", source, message]``.
+  The year is always the current year (shown in the digest window
+  header). Milliseconds are omitted. Multi-line tracebacks inside
+  ``message`` appear as escaped ``\\n`` inside the string.
+
 REASONING OVER THE EVENT LOG
 You are given the last 7 days of Indigo event log narrations alongside
 the static house model. Use them to understand what ACTUALLY happens,
@@ -229,13 +241,16 @@ class DigestRunner:
     def _build_system_blocks(
         self, house_model: dict, rules: List[dict], prior_observations: List[dict]
     ) -> List[dict]:
+        # Compact JSON — the cached block pays 1.25x the base input rate,
+        # so every byte of pretty-print whitespace costs real money for
+        # zero reasoning benefit. Claude doesn't read indentation.
         context = (
             "HOUSE MODEL\n"
-            f"{json.dumps(house_model, indent=2)}\n\n"
+            f"{json.dumps(house_model, separators=(',', ':'))}\n\n"
             "EXISTING AGENT RULES (already enforced by the plugin)\n"
-            f"{json.dumps(rules, indent=2) if rules else '(none yet)'}\n\n"
+            f"{json.dumps(rules, separators=(',', ':')) if rules else '(none yet)'}\n\n"
             "RECENT OBSERVATIONS (past suggestions — avoid repeating)\n"
-            f"{json.dumps(prior_observations, indent=2) if prior_observations else '(none yet)'}"
+            f"{json.dumps(prior_observations, separators=(',', ':')) if prior_observations else '(none yet)'}"
         )
         return [
             {"type": "text", "text": INSTRUCTIONS},
@@ -252,33 +267,46 @@ class DigestRunner:
     ) -> str:
         """Build the volatile user-message block for the digest call.
 
-        The event log is rendered as two fenced code blocks so Claude can
-        parse them deterministically:
+        Compact JSON throughout — Claude doesn't read indentation and the
+        event log dominates the uncached input cost, so every byte of
+        structural overhead matters:
 
-        - ``event_log_summary`` — a single JSON object containing
-          aggregate counts plus ``sql_logger_rollups`` (per-device 7-day
-          activity counts from SQL Logger).
-        - ``event_log_timeline`` — JSON-lines (one object per line), so
-          multi-line error tracebacks in a single event's ``message``
-          survive without being broken by whatever delimiter the prompt
-          uses."""
+        - ``event_log_summary`` — compact JSON object (no indent).
+        - ``event_log_timeline`` — JSON-lines of **positional arrays**
+          ``["MM-DD HH:MM:SS", source, message]`` rather than keyed
+          objects. Drops ~15 tokens/event of repeated JSON keys and
+          the ``20YY-`` / ``.mmm`` timestamp prefix/suffix. Schema is
+          documented in INSTRUCTIONS so Claude knows the positions.
+
+        Multi-line tracebacks in ``message`` still survive because
+        embedded newlines are escaped as ``\\n`` inside the JSON string."""
         local_now = now.astimezone()
-        summary_block = json.dumps(event_summary, indent=2)
-        timeline_lines = [json.dumps(e) for e in events]
+        summary_block = json.dumps(event_summary, separators=(',', ':'))
+        # Timestamp slicing: "2026-04-22 07:37:42.510"[5:19] -> "04-22 07:37:42"
+        # drops year (implicit from the digest window) and milliseconds
+        # (not load-bearing at weekly resolution).
+        timeline_lines = [
+            json.dumps(
+                [e["timestamp"][5:19], e["source"], e["message"]],
+                separators=(',', ':'),
+            )
+            for e in events
+        ]
         timeline_block = "\n".join(timeline_lines)
 
         return (
             f"Current local time: {local_now.isoformat(timespec='minutes')}\n"
             f"Digest window: last {window_days} days "
             f"({since.date().isoformat()} to {now.date().isoformat()})\n\n"
-            "EVENT LOG SUMMARY (JSON — totals, top sources, hourly "
+            "EVENT LOG SUMMARY (compact JSON — totals, top sources, hourly "
             "distribution, and per-device 7-day SQL Logger rollups)\n"
             "```event_log_summary\n"
             f"{summary_block}\n"
             "```\n\n"
-            "EVENT LOG TIMELINE (JSON-lines, chronological — one event "
-            "per line, full message field preserved including multi-line "
-            "tracebacks)\n"
+            "EVENT LOG TIMELINE (JSON-lines positional arrays, "
+            "chronological — schema: [\"MM-DD HH:MM:SS\", source, message]; "
+            "year is the current year; multi-line tracebacks in the "
+            "message field survive as escaped \\n)\n"
             "```event_log_timeline\n"
             f"{timeline_block}\n"
             "```\n\n"
