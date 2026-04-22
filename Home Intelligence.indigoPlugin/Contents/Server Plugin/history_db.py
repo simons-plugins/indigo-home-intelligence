@@ -529,6 +529,17 @@ class HistoryDB:
                 self.logger.error(f"Error running energy rollup: {msg}")
             return {}
 
+        # Diagnostic: log the first two rows verbatim when rollup is
+        # about to return empty from a non-empty query. Otherwise
+        # "Energy rollup: 0 devices have 14d history" gives no clue
+        # whether rows came back at all, whether values were NULL, or
+        # whether the comparison failed.
+        if rows:
+            sample = rows[:2]
+            self.logger.info(
+                f"Energy rollup sample (first 2 of {len(rows)} rows): {sample!r}"
+            )
+
         out = {}
         malformed_rows = 0
         for row in rows:
