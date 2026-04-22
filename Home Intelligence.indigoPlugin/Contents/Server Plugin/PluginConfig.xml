@@ -204,4 +204,25 @@
         <Label>Enable rule evaluator:</Label>
         <Description>Master switch. Disables all agent-written rules without deleting them.</Description>
     </Field>
+
+    <Field id="separator7" type="separator" />
+
+    <Field id="healthEnergyLabel" type="label">
+        <Label>Health &amp; Energy Signals</Label>
+    </Field>
+
+    <Field id="wholeHouseEnergyDeviceId" type="textfield" defaultValue="">
+        <Label>Whole-house energy device ID:</Label>
+        <Description>Indigo device ID of the whole-house energy meter (e.g. Aeon HEM, Glowmarkt CAD). The digest will include a week-over-week kWh comparison when set. Leave blank to skip.</Description>
+    </Field>
+
+    <Field id="batteryLowThreshold" type="textfield" defaultValue="20">
+        <Label>Low battery threshold (%):</Label>
+        <Description>Devices at or below this battery percentage are flagged in the digest's health block.</Description>
+    </Field>
+
+    <Field id="offlineHoursThreshold" type="textfield" defaultValue="24">
+        <Label>Offline threshold (hours):</Label>
+        <Description>Devices whose lastSuccessfulComm is older than this are flagged as offline in the digest. Devices with a non-empty errorState are always flagged regardless of this threshold.</Description>
+    </Field>
 </PluginConfig>

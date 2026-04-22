@@ -56,12 +56,44 @@ GOALS
 - Never re-suggest something the owner has already declined or that is
   already automated by an existing trigger, schedule, or agent rule.
 
+HEALTH & ENERGY SIGNALS
+The ``event_log_summary`` block carries two additional sub-sections
+that summarise the state of the fleet beyond what narrated events
+show:
+
+- ``health.low_batteries``: list of devices whose battery is at or
+  below the configured threshold (default 20%). Each entry has
+  ``{id, name, battery_pct}``.
+- ``health.offline_devices``: devices with ``error_state`` set OR
+  whose ``hours_offline`` exceeds the configured threshold (default
+  24h). Each entry has ``{id, name, error_state, hours_offline}``.
+- ``health.low_batteries_total`` / ``health.offline_devices_total``:
+  full counts when the per-entry lists are capped at 30.
+- ``energy.whole_house``: 7-day vs previous-7-day kWh on the
+  configured whole-house meter. Fields:
+  ``{device_id, this_week_kwh, last_week_kwh, delta_kwh, delta_pct}``.
+  ``delta_pct`` is null when last_week_kwh is zero.
+- ``energy.top_consumers``: top 10 individual devices by this-week
+  consumption, each with the same WoW fields. Excludes the whole-
+  house meter (not double-counting).
+
+How to use them in the narrative:
+- Mention any at-threshold items in the opening weekly-status
+  paragraph. Batteries <20% and offline >24h are concrete, specific
+  items the owner will want to hear about.
+- Frame energy changes: "Heating ran a bit lighter this week (-12%)"
+  or "Your tumble dryer did 18 kWh this week, up 45% on last week".
+- If a single health signal is the most concerning thing this week
+  (e.g. a critical sensor is at 5% battery), flag IT as the
+  observation rather than a speculative event-log pattern.
+
 EVENT LOG FORMAT
 The event log is delivered in two fenced code blocks in the user message:
 
 - ``event_log_summary`` — one compact JSON object with aggregate counts
   (``total_events``, ``top_sources``, ``events_by_hour``,
-  ``sql_logger_rollups``).
+  ``sql_logger_rollups``, plus the ``health`` and ``energy`` blocks
+  described above).
 - ``event_log_timeline`` — JSON-lines, chronological, one **positional
   array** per line with the shape
   ``["YYYY-MM-DD HH:MM:SS", source, message]``. Milliseconds are
@@ -183,6 +215,9 @@ class DigestRunner:
         model: str,
         email_to: str,
         logger,
+        whole_house_energy_device_id: Optional[int] = None,
+        battery_low_threshold: int = 20,
+        offline_hours_threshold: int = 24,
     ):
         self.history_db = history_db
         self.rule_store = rule_store
@@ -191,6 +226,9 @@ class DigestRunner:
         self.model = model
         self.email_to = email_to
         self.logger = logger
+        self.whole_house_energy_device_id = whole_house_energy_device_id
+        self.battery_low_threshold = battery_low_threshold
+        self.offline_hours_threshold = offline_hours_threshold
         self.client = AnthropicClient(api_key=api_key, model=model, logger=logger)
         self.event_log = EventLogReader(logger=logger)
 
@@ -216,6 +254,8 @@ class DigestRunner:
             events = self.event_log.read_window(days_back=window_days)
             event_summary = self.event_log.summarise(events)
             event_summary["sql_logger_rollups"] = self._sql_rollups()
+            event_summary["health"] = self._fleet_health()
+            event_summary["energy"] = self._energy_context()
         except Exception as exc:
             self.logger.exception(f"Digest context gathering failed: {exc}")
             return None
@@ -365,6 +405,141 @@ class DigestRunner:
     # on huge houses where PG psql startup dominates. 300 covers every
     # device I've seen in practice.
     _SQL_ROLLUP_DEVICE_CAP = 300
+
+    # Top N energy consumers to show in the digest. Keeps prompt tokens
+    # bounded on houses with 50+ energy-logged devices. The full per-
+    # device map stays internal; only the top slice hits Claude.
+    _TOP_ENERGY_N = 10
+
+    def _fleet_health(self) -> dict:
+        """Scan ``indigo.devices`` for low batteries and offline
+        devices. Pure in-memory, no SQL — runs in milliseconds regardless
+        of history DB state.
+
+        - ``low_batteries``: any device with ``batteryLevel`` at or
+          below the configured threshold (default 20%).
+        - ``offline_devices``: ``errorState`` set OR
+          ``lastSuccessfulComm`` older than the configured threshold
+          (default 24h). Devices with no ``lastSuccessfulComm`` and no
+          error are skipped — we have no evidence they're offline.
+
+        Disabled devices are always skipped (the house-model filter
+        already drops them; including here would create cross-references
+        to devices Claude doesn't see)."""
+        now = datetime.now().astimezone()
+        low_batteries: List[dict] = []
+        offline_devices: List[dict] = []
+        for dev in indigo.devices:
+            if not bool(getattr(dev, "enabled", True)):
+                continue
+            battery = getattr(dev, "batteryLevel", None)
+            if battery is not None and battery <= self.battery_low_threshold:
+                low_batteries.append(
+                    {"id": dev.id, "name": dev.name, "battery_pct": battery}
+                )
+            error_state = getattr(dev, "errorState", "") or ""
+            last_comm = getattr(dev, "lastSuccessfulComm", None)
+            hours_offline: Optional[float] = None
+            if last_comm is not None:
+                try:
+                    # lastSuccessfulComm is a tz-naive datetime in
+                    # Indigo's local timezone. Coerce comparison via a
+                    # naive now-local.
+                    now_naive = now.replace(tzinfo=None)
+                    hours_offline = round(
+                        (now_naive - last_comm).total_seconds() / 3600, 1
+                    )
+                except Exception:
+                    hours_offline = None
+            is_offline = bool(error_state) or (
+                hours_offline is not None
+                and hours_offline > self.offline_hours_threshold
+            )
+            if is_offline:
+                offline_devices.append(
+                    {
+                        "id": dev.id,
+                        "name": dev.name,
+                        "error_state": error_state or None,
+                        "hours_offline": hours_offline,
+                    }
+                )
+        # Cap each list at 30 entries; more than that and the digest
+        # prompt ballooning matters more than naming every single one.
+        # Claude can still say "and 14 others" from the total count.
+        return {
+            "low_batteries": sorted(low_batteries, key=lambda x: x["battery_pct"])[:30],
+            "low_batteries_total": len(low_batteries),
+            "offline_devices": offline_devices[:30],
+            "offline_devices_total": len(offline_devices),
+        }
+
+    def _energy_context(self) -> dict:
+        """Return whole-house week-over-week kWh plus the top N
+        per-device consumers with their own WoW deltas.
+
+        Returns an empty dict if the history DB isn't configured, the
+        whole-house device isn't set, or the queries fail. Energy is
+        nice-to-have — the digest still runs without it."""
+        if self.history_db is None:
+            return {}
+        try:
+            energy_device_ids = self.history_db.discover_energy_tables()
+        except Exception as exc:
+            self.logger.warning(f"Energy-table discovery failed: {exc}")
+            return {}
+        if not energy_device_ids:
+            return {}
+
+        # Only query devices that discovery found — discovery filters to
+        # tables that actually have the ``accumEnergyTotal`` column, so
+        # adding IDs outside that list would cause the UNION ALL to fail
+        # on a missing / mis-typed table. If the configured whole-house
+        # ID isn't in discovery, the whole_house block will legitimately
+        # be omitted below.
+        try:
+            rollups = self.history_db.energy_rollup_14d(energy_device_ids)
+        except Exception as exc:
+            self.logger.warning(f"Energy rollup_14d failed: {exc}")
+            return {}
+
+        out: dict = {}
+
+        # Whole-house: pluck by configured device ID if set.
+        if self.whole_house_energy_device_id is not None:
+            wh = rollups.get(self.whole_house_energy_device_id)
+            if wh is not None:
+                out["whole_house"] = {
+                    "device_id": self.whole_house_energy_device_id,
+                    **wh,
+                }
+
+        # Top consumers: per-device list, excluding the whole-house meter
+        # (since it's the sum of everything downstream, counting it in
+        # the "top consumers" list would always put it #1 and be
+        # double-counting relative to itself).
+        individual = {
+            did: data
+            for did, data in rollups.items()
+            if did != self.whole_house_energy_device_id
+        }
+        # Sort by this-week consumption desc. Name resolution happens
+        # inline via indigo.devices; missing names fall back to the id.
+        name_lookup = {dev.id: dev.name for dev in indigo.devices}
+        top = sorted(
+            individual.items(),
+            key=lambda kv: kv[1].get("this_week_kwh", 0),
+            reverse=True,
+        )[: self._TOP_ENERGY_N]
+        out["top_consumers"] = [
+            {
+                "id": did,
+                "name": name_lookup.get(did, str(did)),
+                **data,
+            }
+            for did, data in top
+        ]
+        return out
 
     def _sql_rollups(self) -> dict:
         """Return per-device 7-day activity counts from SQL Logger, keyed

@@ -1,6 +1,6 @@
 """Tests for plugin.py module-level pure helpers."""
 
-from plugin import _as_bool
+from plugin import _as_bool, _as_int, _as_optional_int
 
 
 class TestAsBool:
@@ -53,3 +53,51 @@ class TestAsBool:
     def test_whitespace_is_stripped(self):
         assert _as_bool(" true ") is True
         assert _as_bool("  false ") is False
+
+
+class TestAsInt:
+    def test_valid_int(self):
+        assert _as_int("42", 0) == 42
+
+    def test_empty_returns_default(self):
+        assert _as_int("", 20) == 20
+        assert _as_int(None, 20) == 20
+
+    def test_invalid_returns_default(self):
+        assert _as_int("not-a-number", 20) == 20
+        assert _as_int("12.5", 20) == 20  # int() rejects floats as strings
+
+    def test_below_min_returns_default(self):
+        # Pref typo — a battery threshold of -5 makes no sense; fall
+        # back rather than silently accept.
+        assert _as_int("-5", 20, min_value=0, max_value=100) == 20
+
+    def test_above_max_returns_default(self):
+        # Battery threshold of 200% is unreachable — fall back.
+        assert _as_int("200", 20, min_value=0, max_value=100) == 20
+
+    def test_at_boundary_accepted(self):
+        assert _as_int("0", 20, min_value=0, max_value=100) == 0
+        assert _as_int("100", 20, min_value=0, max_value=100) == 100
+
+    def test_no_bounds_accepts_anything_in_int_range(self):
+        assert _as_int("999999", 0) == 999999
+        assert _as_int("-999999", 0) == -999999
+
+
+class TestAsOptionalInt:
+    def test_valid_int(self):
+        assert _as_optional_int("452894065") == 452894065
+
+    def test_empty_returns_none(self):
+        assert _as_optional_int("") is None
+        assert _as_optional_int(None) is None
+
+    def test_invalid_returns_none(self):
+        assert _as_optional_int("not-a-number") is None
+
+    def test_negative_accepted(self):
+        # Device IDs are positive but validation lives at the call site
+        # (whether the ID is in discovery) — the helper itself just
+        # parses.
+        assert _as_optional_int("-1") == -1

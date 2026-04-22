@@ -398,6 +398,241 @@ class HistoryDB:
                 )
         return out
 
+    def discover_energy_tables(self):
+        """Return the device IDs whose history table has an
+        ``accumEnergyTotal`` column. One metadata query — avoids
+        probing every device table individually to find out whether
+        energy history exists.
+
+        SQL Logger stores a ``accumEnergyTotal`` column on devices
+        that publish that state (smart plugs, energy meters); devices
+        without energy metering don't have the column so we skip them
+        cleanly rather than querying and hitting 'column doesn't exist'
+        once per device.
+
+        Returns a list of device IDs (ints), empty on query failure."""
+        try:
+            if self.db_type == "sqlite":
+                # SQLite stores column info per-table — pragma_table_info
+                # doesn't filter across tables so we use sqlite_master +
+                # a LIKE on the CREATE statement. Fast on a 500-device
+                # house (<50ms).
+                sql = (
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type='table' "
+                    "AND name LIKE 'device_history_%' "
+                    "AND sql LIKE '%accumEnergyTotal%'"
+                )
+                _, rows = self._execute(sql)
+                table_names = [r[0] for r in rows]
+            else:
+                # PostgreSQL folds unquoted identifiers to lowercase, so
+                # SQL Logger's ``accumEnergyTotal`` state becomes an
+                # ``accumenergytotal`` column. Case-sensitive string
+                # compare on column_name would return zero rows; use
+                # LOWER() to be explicit about the folding and stay
+                # robust to either-case storage.
+                sql = (
+                    "SELECT table_name FROM information_schema.columns "
+                    "WHERE LOWER(column_name) = 'accumenergytotal' "
+                    "AND table_schema = 'public' "
+                    "AND table_name LIKE 'device_history_%'"
+                )
+                _, rows = self._execute(sql)
+                table_names = [r[0] for r in rows]
+        except Exception as exc:
+            msg = str(exc)
+            if self.db_type == "postgresql":
+                hint = self._diagnose_pg_error(msg)
+                self.logger.error(
+                    f"SQL Logger energy-table discovery failed: {hint}. Raw: {msg}"
+                )
+            else:
+                self.logger.error(f"Error discovering energy tables: {msg}")
+            return []
+
+        device_ids = []
+        for name in table_names:
+            parts = name.split("device_history_")
+            if len(parts) == 2 and parts[1].isdigit():
+                device_ids.append(int(parts[1]))
+        self.logger.info(
+            f"Energy-table discovery: {len(device_ids)} device(s) "
+            f"have accumEnergyTotal history"
+        )
+        return device_ids
+
+    def energy_rollup_14d(self, device_ids):
+        """Per-device energy snapshots at now / -7d / -14d.
+
+        Returns ``{device_id: {"this_week_kwh": float, "last_week_kwh":
+        float, "delta_kwh": float, "delta_pct": float | None}}``.
+        Devices with insufficient history (less than 14 days of data)
+        are omitted rather than reported with zero/null values — a
+        week-over-week comparison isn't meaningful without both points.
+
+        Uses a single UNION ALL query per backend (not one query per
+        device) — on PG that means a single ``psql`` invocation rather
+        than N × subprocess overhead, which matters once you have 100+
+        energy-logged devices.
+
+        ``delta_pct`` is ``None`` when ``last_week_kwh`` is zero to
+        avoid divide-by-zero; the caller treats this as 'no baseline,
+        can't compare'."""
+        if not device_ids:
+            return {}
+        valid_ids = [did for did in device_ids if isinstance(did, int)]
+        if not valid_ids:
+            return {}
+
+        now = datetime.now(timezone.utc)
+        week_ago_ts = (now - timedelta(days=7)).strftime("%Y-%m-%d %H:%M:%S")
+        two_weeks_ago_ts = (now - timedelta(days=14)).strftime("%Y-%m-%d %H:%M:%S")
+
+        # Build one UNION ALL query: one row per device with three
+        # scalar-subquery columns (now, -7d, -14d).
+        #
+        # IMPORTANT: ``WHERE accumEnergyTotal IS NOT NULL`` on each
+        # subquery. SQL Logger writes a row for every device state
+        # change, but not every row has every column populated — a
+        # smart plug's most recent row is likely its last on/off
+        # toggle, which may not carry an accumEnergyTotal value.
+        # Without the IS NOT NULL filter, most devices return NULL
+        # from the latest row and get dropped despite having plenty
+        # of historical kWh data in earlier rows.
+        parts = []
+        for did in valid_ids:
+            table = f'"device_history_{did}"'
+            parts.append(
+                f"SELECT {did} AS id, "
+                f"(SELECT accumEnergyTotal FROM {table} "
+                f"WHERE accumEnergyTotal IS NOT NULL "
+                f"ORDER BY ts DESC LIMIT 1) AS now_v, "
+                f"(SELECT accumEnergyTotal FROM {table} "
+                f"WHERE accumEnergyTotal IS NOT NULL "
+                f"AND ts <= '{week_ago_ts}' "
+                f"ORDER BY ts DESC LIMIT 1) AS w1, "
+                f"(SELECT accumEnergyTotal FROM {table} "
+                f"WHERE accumEnergyTotal IS NOT NULL "
+                f"AND ts <= '{two_weeks_ago_ts}' "
+                f"ORDER BY ts DESC LIMIT 1) AS w2"
+            )
+        sql = " UNION ALL ".join(parts)
+
+        try:
+            _, rows = self._execute(sql)
+        except Exception as exc:
+            msg = str(exc)
+            if self.db_type == "postgresql":
+                hint = self._diagnose_pg_error(msg)
+                self.logger.error(
+                    f"SQL Logger energy rollup failed: {hint}. Raw: {msg}"
+                )
+            else:
+                self.logger.error(f"Error running energy rollup: {msg}")
+            return {}
+
+        out = {}
+        for row in rows:
+            # psql with --unaligned + --pset null="" trims trailing empty
+            # fields — a row with NULL in the last column(s) comes back
+            # with fewer tab-separated fields than the query defined.
+            # Pad with empty strings so unpacking is safe and downstream
+            # NULL-checks just see "" as expected.
+            if len(row) < 4:
+                row = tuple(row) + ("",) * (4 - len(row))
+            did_raw, now_v_raw, w1_raw, w2_raw = row[0], row[1], row[2], row[3]
+            try:
+                did = int(did_raw)
+            except (TypeError, ValueError):
+                continue
+            # This-week (now - 7d-ago) is the primary metric; emit
+            # partial data when the 14d-ago snapshot is missing, since
+            # the week's consumption is still useful without the WoW
+            # comparison. Many devices have sparse old data even when
+            # current logging is dense.
+            if now_v_raw in (None, "") or w1_raw in (None, ""):
+                continue
+            try:
+                now_v = float(now_v_raw)
+                w1 = float(w1_raw)
+            except (TypeError, ValueError):
+                continue
+            this_week = round(now_v - w1, 3)
+
+            last_week: Optional[float] = None
+            delta_kwh: Optional[float] = None
+            delta_pct: Optional[float] = None
+            if w2_raw not in (None, ""):
+                try:
+                    w2 = float(w2_raw)
+                    last_week = round(w1 - w2, 3)
+                    delta_kwh = round(this_week - last_week, 3)
+                    if last_week == 0:
+                        delta_pct = None
+                    else:
+                        delta_pct = round(100.0 * delta_kwh / last_week, 1)
+                except (TypeError, ValueError):
+                    pass
+            out[did] = {
+                "this_week_kwh": this_week,
+                "last_week_kwh": last_week,
+                "delta_kwh": delta_kwh,
+                "delta_pct": delta_pct,
+            }
+        with_wow = sum(1 for d in out.values() if d.get("last_week_kwh") is not None)
+        self.logger.info(
+            f"Energy rollup: {len(out)} device(s) have this-week usage "
+            f"(of which {with_wow} also have last-week for WoW delta); "
+            f"queried {len(valid_ids)}"
+        )
+        return out
+
+    def diagnose_energy_columns(self):
+        """One-shot schema diagnostic: enumerate every column across all
+        ``device_history_*`` tables whose name hints at energy/power
+        measurement, and log how many devices have each. Lets the
+        operator see exactly which column names SQL Logger is using
+        for energy on THIS install — rather than assuming the standard
+        ``accumEnergyTotal`` is present everywhere."""
+        if self.db_type != "postgresql":
+            return
+        sql = (
+            "SELECT column_name, COUNT(DISTINCT table_name) AS device_count "
+            "FROM information_schema.columns "
+            "WHERE table_schema = 'public' "
+            "AND table_name LIKE 'device_history_%' "
+            "AND ("
+            "  LOWER(column_name) LIKE '%energy%' "
+            "  OR LOWER(column_name) LIKE '%power%' "
+            "  OR LOWER(column_name) LIKE '%kwh%' "
+            "  OR LOWER(column_name) LIKE '%watt%' "
+            "  OR LOWER(column_name) LIKE '%usage%' "
+            "  OR LOWER(column_name) LIKE '%consumption%' "
+            "  OR LOWER(column_name) LIKE '%meter%' "
+            ") "
+            "GROUP BY column_name "
+            "ORDER BY device_count DESC, column_name"
+        )
+        try:
+            _, rows = self._execute(sql)
+        except Exception as exc:
+            self.logger.warning(f"Energy column diagnosis failed: {exc}")
+            return
+        if not rows:
+            self.logger.info("Energy column diagnosis: no matching columns")
+            return
+        self.logger.info(
+            f"Energy column diagnosis: {len(rows)} candidate column(s)"
+        )
+        for row in rows:
+            col = row[0]
+            try:
+                count = int(row[1])
+            except (TypeError, ValueError):
+                count = 0
+            self.logger.info(f"  '{col}': {count} device(s)")
+
     def close(self):
         """No persistent connections to close (SQLite opens per-query, PG uses psql CLI)."""
         pass

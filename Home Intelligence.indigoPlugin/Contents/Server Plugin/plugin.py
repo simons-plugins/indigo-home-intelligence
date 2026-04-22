@@ -53,6 +53,39 @@ def _as_bool(value, default: bool = False) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes", "on")
 
 
+def _as_int(value, default: int, min_value=None, max_value=None) -> int:
+    """Coerce an Indigo textfield pref (stored as string) to int.
+    Falls back to ``default`` on None / empty / invalid / out-of-range.
+
+    Range bounds are optional but recommended for user-facing prefs —
+    a typo like "200" for a battery percentage would otherwise silently
+    set an unreachable threshold."""
+    if value is None or value == "":
+        return default
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    if min_value is not None and parsed < min_value:
+        return default
+    if max_value is not None and parsed > max_value:
+        return default
+    return parsed
+
+
+def _as_optional_int(value):
+    """Coerce an Indigo textfield pref to an optional int — returns
+    None when the pref is blank, rather than a fallback. Used for
+    truly-optional settings like the whole-house energy device ID
+    where absence is meaningful."""
+    if value is None or value == "":
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
 class Plugin(indigo.PluginBase):
     def __init__(self, pluginId, pluginDisplayName, pluginVersion, pluginPrefs):
         super().__init__(pluginId, pluginDisplayName, pluginVersion, pluginPrefs)
@@ -134,6 +167,17 @@ class Plugin(indigo.PluginBase):
             model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
             email_to=self.pluginPrefs.get("digestEmailTo", ""),
             logger=self.logger,
+            whole_house_energy_device_id=_as_optional_int(
+                self.pluginPrefs.get("wholeHouseEnergyDeviceId")
+            ),
+            battery_low_threshold=_as_int(
+                self.pluginPrefs.get("batteryLowThreshold"),
+                20, min_value=0, max_value=100,
+            ),
+            offline_hours_threshold=_as_int(
+                self.pluginPrefs.get("offlineHoursThreshold"),
+                24, min_value=0, max_value=168,
+            ),
         )
 
     # ------------------------------------------------------------------
@@ -501,6 +545,30 @@ class Plugin(indigo.PluginBase):
 
         if self.history_db.test_connection():
             self.logger.info(f"SQL Logger ready: {target}")
+            # One-shot startup rollup dry-run — lets us validate the
+            # energy rollup query returns sensible counts without
+            # firing a digest (each digest costs real money through
+            # Claude). Safe to leave in; it's one DB query.
+            try:
+                ids = self.history_db.discover_energy_tables()
+                if ids:
+                    rollup = self.history_db.energy_rollup_14d(ids)
+                    name_lookup = {dev.id: dev.name for dev in indigo.devices}
+                    this_week_only = sorted(
+                        did for did, d in rollup.items()
+                        if d.get("last_week_kwh") is None
+                    )
+                    if this_week_only:
+                        labelled = [
+                            f"{did}={name_lookup.get(did, '?')!r}"
+                            for did in this_week_only
+                        ]
+                        self.logger.info(
+                            f"Rollup this-week-only (no 14d baseline, "
+                            f"{len(this_week_only)}): {labelled}"
+                        )
+            except Exception as exc:
+                self.logger.warning(f"Rollup dry-run failed: {exc}")
         else:
             self.logger.warning(
                 f"SQL Logger unavailable: {target}. Digest will run "
