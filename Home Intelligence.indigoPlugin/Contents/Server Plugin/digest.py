@@ -113,7 +113,7 @@ The JSON object must have this shape:
 
   {
     "subject": "<email subject line, 40-80 chars>",
-    "narrative_markdown": "<digest body as Markdown, 200-600 words, inverted pyramid: headline paragraph, a timeline or observation, inference, closing line>",
+    "narrative_markdown": "<digest body as Markdown, see NARRATIVE STRUCTURE>",
     "observation": null | {
       "headline": "<one-line summary of the observation>",
       "rationale": "<1-3 sentences: WHY you're flagging this>",
@@ -122,9 +122,45 @@ The JSON object must have this shape:
     }
   }
 
-If nothing is worth the owner's attention this week, set `observation`
-to null. It's better to say "quiet week, everything looks healthy" than
-to invent a concern.
+SUBJECT FORMAT
+Start the subject with the week range in the form "Week of D-D Mon:"
+followed by a short headline summarising this week. 40-80 chars total.
+The plugin appends an "[obs-XXXXXX]" reply token; you don't include it.
+Examples:
+  "Week of 14-21 Apr: Dining TRV keeps dropping off"
+  "Week of 14-21 Apr: quiet week, everything healthy"
+
+NARRATIVE STRUCTURE
+Always follow this order. Don't deviate even when the week is quiet —
+the consistent shape is what makes the weekly email feel like a
+newsletter rather than an alert.
+
+  1. Opening section with "## <warm weekly-status heading>"
+     — one paragraph (3-5 sentences) giving the big picture of the
+     week: what's running smoothly, what agent rules are quietly
+     holding, notable calm. Addresses the owner directly as "you".
+     Even when flagging an observation, lead with the roundup FIRST
+     so the observation lands in context rather than cold.
+
+  2. "### What caught my eye"
+     — 2-4 paragraphs describing the observation in narrative prose.
+     Use **bold** sparingly to highlight device names or key facts.
+     Omit this section entirely (and the next) on a quiet week with
+     observation=null.
+
+  3. "### The inference"
+     — 1-2 paragraphs explaining WHY this pattern matters and what a
+     proposed rule would do differently. Omit on a quiet week.
+
+  4. Closing line
+     — warm single sentence inviting a reply, or (on a quiet week)
+     a reassuring one-liner confirming nothing requires attention.
+
+For quiet weeks (observation=null): expand the opening roundup to
+2-3 paragraphs covering each category (heating, lighting, security,
+cost / automations) rather than collapsing it. It's better to say
+"quiet week, everything looks healthy" at length than to invent a
+concern.
 
 Keep the narrative warm and direct, not corporate. Refer to the owner
 as "you".
