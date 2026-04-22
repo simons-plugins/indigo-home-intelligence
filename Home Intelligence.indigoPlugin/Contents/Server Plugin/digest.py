@@ -232,7 +232,7 @@ class DigestRunner:
             )
             return None
 
-        return self._deliver(parsed)
+        return self._deliver(parsed, usage, cost_gbp)
 
     # ------------------------------------------------------------------
     # Prompt construction
@@ -853,7 +853,9 @@ class DigestRunner:
                     return None
             return None
 
-    def _deliver(self, parsed: dict) -> Optional[str]:
+    def _deliver(
+        self, parsed: dict, usage: dict, cost_gbp: float
+    ) -> Optional[str]:
         subject = (parsed.get("subject") or "Home Intelligence — weekly digest").strip()
         body_markdown = parsed.get("narrative_markdown") or "(empty digest)"
         observation = parsed.get("observation")
@@ -872,6 +874,10 @@ class DigestRunner:
                 body_markdown = self._append_reply_footer(body_markdown, stored_obs)
             except Exception as exc:
                 self.logger.exception(f"Failed to persist observation: {exc}")
+
+        # Always append cost to the email — makes the weekly run
+        # self-observable without having to check the Indigo log.
+        body_markdown = self._append_cost_footer(body_markdown, usage, cost_gbp)
 
         # Classified send so we can distinguish permanent from transient
         # SMTP failure. On a permanent failure we roll back the
@@ -929,3 +935,29 @@ class DigestRunner:
                 "Reply **NO** if this observation isn't useful and I'll stop flagging it."
             )
         return body.rstrip() + "\n" + "\n".join(footer_lines)
+
+    @staticmethod
+    def _append_cost_footer(body: str, usage: dict, cost_gbp: float) -> str:
+        """Append a single-line cost/usage summary to the digest body.
+
+        Always runs regardless of whether an observation was flagged, so
+        "quiet week" digests (observation=null, no reply footer) still
+        show the run cost. Helps the user sanity-check monthly spend
+        against the configured cap without needing to scan Indigo logs.
+        Token figures use thousands separators so they're readable in a
+        Markdown body."""
+        in_tokens = usage.get("input_tokens", 0)
+        out_tokens = usage.get("output_tokens", 0)
+        cache_read = usage.get("cache_read_input_tokens", 0)
+        cache_write = usage.get("cache_creation_input_tokens", 0)
+        cost_line = (
+            f"_Run cost: ~£{cost_gbp:.2f} — "
+            f"in {in_tokens:,}, out {out_tokens:,}, "
+            f"cache read {cache_read:,}, cache write {cache_write:,}._"
+        )
+        # Insert a horizontal rule only if the body doesn't already end
+        # with one (i.e. there was no reply footer before us).
+        stripped = body.rstrip()
+        if stripped.endswith("---"):
+            return stripped + "\n\n" + cost_line + "\n"
+        return stripped + "\n\n---\n\n" + cost_line + "\n"
