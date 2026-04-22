@@ -491,18 +491,14 @@ class DigestRunner:
         if not energy_device_ids:
             return {}
 
-        # Include the whole-house device in the bulk query even if it's
-        # not otherwise in the discovery list (defensive against a weird
-        # schema state).
-        query_ids = list(energy_device_ids)
-        if (
-            self.whole_house_energy_device_id is not None
-            and self.whole_house_energy_device_id not in query_ids
-        ):
-            query_ids.append(self.whole_house_energy_device_id)
-
+        # Only query devices that discovery found — discovery filters to
+        # tables that actually have the ``accumEnergyTotal`` column, so
+        # adding IDs outside that list would cause the UNION ALL to fail
+        # on a missing / mis-typed table. If the configured whole-house
+        # ID isn't in discovery, the whole_house block will legitimately
+        # be omitted below.
         try:
-            rollups = self.history_db.energy_rollup_14d(query_ids)
+            rollups = self.history_db.energy_rollup_14d(energy_device_ids)
         except Exception as exc:
             self.logger.warning(f"Energy rollup_14d failed: {exc}")
             return {}

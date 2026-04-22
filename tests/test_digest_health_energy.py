@@ -272,6 +272,34 @@ class TestEnergyContext:
         assert "whole_house" not in ctx
         assert len(ctx["top_consumers"]) == 1
 
+    def test_whole_house_id_not_in_discovery_omits_whole_house(self, patched_devices):
+        """If the user configures a whole-house device ID that isn't
+        in SQL Logger discovery (never set up for energy logging, or
+        table dropped), the whole_house block is omitted — we don't
+        forcibly add the ID to the bulk query, because that would make
+        the UNION ALL fail on the missing table."""
+        patched_devices([SimpleNamespace(id=100, name="Tumble Dryer")])
+        history_db = MagicMock()
+        # Discovery returns ONLY device 100; the configured whole-house
+        # ID 999 is NOT in the list.
+        history_db.discover_energy_tables.return_value = [100]
+        history_db.energy_rollup_14d.return_value = {
+            100: {
+                "this_week_kwh": 18.4, "last_week_kwh": 12.7,
+                "delta_kwh": 5.7, "delta_pct": 44.9,
+            },
+        }
+        runner = _make_runner(
+            history_db=history_db,
+            whole_house_energy_device_id=999,
+        )
+        ctx = runner._energy_context()
+        assert "whole_house" not in ctx
+        assert ctx["top_consumers"][0]["name"] == "Tumble Dryer"
+        # Verify rollup was called with ONLY the discovered IDs — not
+        # with the configured-but-undiscovered 999 appended defensively.
+        history_db.energy_rollup_14d.assert_called_once_with([100])
+
     def test_top_consumers_capped_at_10(self, patched_devices):
         # 15 devices — result list should be 10.
         devs = [SimpleNamespace(id=i, name=f"Dev{i}") for i in range(15)]

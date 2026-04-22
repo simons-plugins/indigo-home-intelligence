@@ -53,15 +53,24 @@ def _as_bool(value, default: bool = False) -> bool:
     return str(value).strip().lower() in ("true", "1", "yes", "on")
 
 
-def _as_int(value, default: int) -> int:
+def _as_int(value, default: int, min_value=None, max_value=None) -> int:
     """Coerce an Indigo textfield pref (stored as string) to int.
-    Falls back to ``default`` on None / empty / invalid."""
+    Falls back to ``default`` on None / empty / invalid / out-of-range.
+
+    Range bounds are optional but recommended for user-facing prefs —
+    a typo like "200" for a battery percentage would otherwise silently
+    set an unreachable threshold."""
     if value is None or value == "":
         return default
     try:
-        return int(value)
+        parsed = int(value)
     except (TypeError, ValueError):
         return default
+    if min_value is not None and parsed < min_value:
+        return default
+    if max_value is not None and parsed > max_value:
+        return default
+    return parsed
 
 
 def _as_optional_int(value):
@@ -162,10 +171,12 @@ class Plugin(indigo.PluginBase):
                 self.pluginPrefs.get("wholeHouseEnergyDeviceId")
             ),
             battery_low_threshold=_as_int(
-                self.pluginPrefs.get("batteryLowThreshold"), 20
+                self.pluginPrefs.get("batteryLowThreshold"),
+                20, min_value=0, max_value=100,
             ),
             offline_hours_threshold=_as_int(
-                self.pluginPrefs.get("offlineHoursThreshold"), 24
+                self.pluginPrefs.get("offlineHoursThreshold"),
+                24, min_value=0, max_value=168,
             ),
         )
 
