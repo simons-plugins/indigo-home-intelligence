@@ -585,6 +585,14 @@ class HistoryDB:
             f"Energy rollup: {len(out)} device(s) have 14d history "
             f"(from {len(valid_ids)} queried, {malformed_rows} malformed)"
         )
+        if out:
+            # Surface the actual surviving device IDs so the operator
+            # can see whether their configured whole-house device made
+            # it through (and identify which individual devices are
+            # actually being logged).
+            self.logger.info(
+                f"Energy rollup: devices with 14d history: {sorted(out.keys())}"
+            )
         return out
 
     def close(self):
