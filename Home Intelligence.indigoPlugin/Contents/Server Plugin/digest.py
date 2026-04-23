@@ -540,7 +540,12 @@ class DigestRunner:
         when = rule.get("when")
         if not isinstance(when, dict):
             return f"{path}.when missing or not an object"
-        if not isinstance(when.get("device_id"), int):
+        # Bool is a subclass of int in Python — `isinstance(True, int)` is
+        # True — so we must explicitly reject bools to prevent a JSON
+        # `"device_id": true` sneaking past the gate. `indigo.devices[True]`
+        # would blow up far downstream; catch it here.
+        when_device = when.get("device_id")
+        if not isinstance(when_device, int) or isinstance(when_device, bool):
             return f"{path}.when.device_id must be an int"
         if not isinstance(when.get("state"), str) or not when["state"]:
             return f"{path}.when.state missing or empty"
@@ -550,10 +555,14 @@ class DigestRunner:
         then = rule.get("then")
         if not isinstance(then, dict):
             return f"{path}.then missing or not an object"
-        if not isinstance(then.get("device_id"), int):
+        then_device = then.get("device_id")
+        if not isinstance(then_device, int) or isinstance(then_device, bool):
             return f"{path}.then.device_id must be an int"
         op = then.get("op")
-        if op not in cls._ALLOWED_RULE_OPS:
+        # op membership test: a list / dict / any unhashable would raise
+        # TypeError against a frozenset. Type-check first so the caller
+        # gets a clean schema error instead of a 500.
+        if not isinstance(op, str) or op not in cls._ALLOWED_RULE_OPS:
             return f"{path}.then.op must be one of {sorted(cls._ALLOWED_RULE_OPS)}, got {op!r}"
 
         return None
