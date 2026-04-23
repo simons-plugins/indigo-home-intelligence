@@ -30,6 +30,7 @@ from digest import DigestRunner
 from delivery import DeliveryClient
 from inbox import InboxPoller, InboxPollError
 from mcp_handler import MCPHandler
+import mcp_tools
 
 
 DAYS_OF_WEEK = {
@@ -281,9 +282,16 @@ class Plugin(indigo.PluginBase):
             server_name="home-intelligence",
             server_version=self.pluginVersion,
         )
-        # Tool + resource registration happens in later commits (PRD-0002
-        # Phase 1 steps 3-4). Handshake-only for now so Claude Desktop
-        # can complete initialize and see an empty tool list.
+        mcp_tools.register_all(
+            self.mcp,
+            context=self.context,
+            rule_store=self.rule_store,
+            observation_store=self.observation_store,
+            history_db=self.history_db,
+            logger=self.logger,
+        )
+        # Resource registration (digest_instructions) lands in the next
+        # commit.
 
     # ------------------------------------------------------------------
     # Main loop
