@@ -370,3 +370,30 @@ class TestRegisterAll:
             "house_context_snapshot",
             "query_sql_logger",
         ]
+
+    def test_registers_digest_instructions_resource(self, handler, logger):
+        mcp_tools.register_all(
+            handler,
+            context=_FakeContext(),
+            rule_store=_FakeRuleStore([]),
+            observation_store=_FakeObservationStore([]),
+            history_db=_FakeHistoryDB(result={"points": []}),
+            logger=logger,
+        )
+        # resources/list surfaces it.
+        rpc = {"jsonrpc": "2.0", "id": 1, "method": "resources/list"}
+        resp = handler.handle_request("POST", {"Accept": "application/json"}, json.dumps(rpc))
+        resources = json.loads(resp["content"])["result"]["resources"]
+        uris = [r["uri"] for r in resources]
+        assert mcp_tools.DIGEST_INSTRUCTIONS_URI in uris
+
+        # resources/read returns the real INSTRUCTIONS content.
+        from digest import INSTRUCTIONS
+        rpc = {
+            "jsonrpc": "2.0", "id": 2, "method": "resources/read",
+            "params": {"uri": mcp_tools.DIGEST_INSTRUCTIONS_URI},
+        }
+        resp = handler.handle_request("POST", {"Accept": "application/json"}, json.dumps(rpc))
+        body = json.loads(resp["content"])
+        assert body["result"]["contents"][0]["text"] == INSTRUCTIONS
+        assert body["result"]["contents"][0]["mimeType"] == "text/markdown"

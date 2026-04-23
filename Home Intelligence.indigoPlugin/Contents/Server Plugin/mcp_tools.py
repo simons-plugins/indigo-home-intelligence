@@ -19,6 +19,9 @@ from data_access import HouseContextAccess
 from event_log_reader import EventLogReader
 
 
+DIGEST_INSTRUCTIONS_URI = "home-intelligence:digest_instructions"
+
+
 # Allowed values for query_sql_logger's time_range argument. Matches
 # ``history_db.RANGE_BUCKETS`` keys. Keeping the list here (rather
 # than importing from history_db) makes it a frozen public contract:
@@ -53,7 +56,7 @@ def register_all(
     history_db,
     logger,
 ) -> None:
-    """Register all four read tools on the given MCPHandler."""
+    """Register all read tools + resources on the given MCPHandler."""
     _register_get_rules(handler, rule_store=rule_store)
     _register_get_observations(handler, observation_store=observation_store)
     _register_query_sql_logger(handler, history_db=history_db, logger=logger)
@@ -63,6 +66,30 @@ def register_all(
         rule_store=rule_store,
         observation_store=observation_store,
         logger=logger,
+    )
+    _register_digest_instructions_resource(handler)
+
+
+def _register_digest_instructions_resource(handler) -> None:
+    """Publish the plugin's INSTRUCTIONS text as an MCP resource so
+    interactive Claude can opt into the same reasoning guide the
+    weekly email uses. Importing here (function scope) avoids pulling
+    the digest module into plugin startup if this function is never
+    called."""
+    from digest import INSTRUCTIONS
+
+    handler.register_resource(
+        uri=DIGEST_INSTRUCTIONS_URI,
+        name="Home Intelligence digest instructions",
+        description=(
+            "The reasoning guide the weekly digest runs Claude under — "
+            "filtering rules, health/energy signals, event log schema, "
+            "auto-disabled rule handling, rule-target safety allowlist, "
+            "output format. Fetch this when asked for digest-style "
+            "output; otherwise answer directly from the tools."
+        ),
+        handler=lambda: INSTRUCTIONS,
+        mime_type="text/markdown",
     )
 
 
