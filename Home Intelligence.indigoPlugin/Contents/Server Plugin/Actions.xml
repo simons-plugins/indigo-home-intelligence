@@ -17,6 +17,18 @@
         <CallbackMethod>handle_status</CallbackMethod>
     </Action>
 
+    <!-- MCP (Model Context Protocol) endpoint. JSON-RPC 2.0 over HTTP
+         POST. Claude Desktop / Claude Code connect here (via the
+         `mcp-remote` bridge or native HTTP transport) to interrogate
+         the house via the plugin's read-only tool surface. Auth is
+         handled at the reflector layer for remote access; LAN access
+         is implicit-trust per ADR-0004.
+         URL: POST /message/com.simons-plugins.home-intelligence/mcp -->
+    <Action id="mcp" uiPath="hidden">
+        <Name>MCP Endpoint</Name>
+        <CallbackMethod>handle_mcp</CallbackMethod>
+    </Action>
+
     <!-- Programmatic trigger for a digest run. Same flow as the
          "Run Digest Now" menu item but callable from:
            - An Indigo Action Group step ("Execute Plugin Action")

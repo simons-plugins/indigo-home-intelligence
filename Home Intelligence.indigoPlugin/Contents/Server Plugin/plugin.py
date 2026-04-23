@@ -29,6 +29,7 @@ from observation_store import ObservationStore
 from digest import DigestRunner
 from delivery import DeliveryClient
 from inbox import InboxPoller, InboxPollError
+from mcp_handler import MCPHandler
 
 
 DAYS_OF_WEEK = {
@@ -186,6 +187,8 @@ class Plugin(indigo.PluginBase):
         self.digest = None
         self.delivery = None
         self.inbox = None
+        self.mcp = None
+        self.context = None
         self._last_eval_at = 0.0
         self._last_inbox_poll_at = 0.0
         self._last_digest_date = None
@@ -273,6 +276,14 @@ class Plugin(indigo.PluginBase):
             email_to=self.pluginPrefs.get("digestEmailTo", ""),
             logger=self.logger,
         )
+        self.mcp = MCPHandler(
+            logger=self.logger,
+            server_name="home-intelligence",
+            server_version=self.pluginVersion,
+        )
+        # Tool + resource registration happens in later commits (PRD-0002
+        # Phase 1 steps 3-4). Handshake-only for now so Claude Desktop
+        # can complete initialize and see an empty tool list.
 
     # ------------------------------------------------------------------
     # Main loop
@@ -567,6 +578,39 @@ class Plugin(indigo.PluginBase):
             except Exception as exc:
                 snapshot["observations_error"] = str(exc)
         return snapshot
+
+    def handle_mcp(self, action, dev=None, callerWaitingForResult=None):
+        """IWS entry point for the MCP endpoint at
+        ``POST /message/<plugin-id>/mcp``. Extracts HTTP method, headers,
+        and body from the incoming action and delegates to MCPHandler,
+        which returns the IWS-shaped response dict."""
+        if self.mcp is None:
+            self.logger.error("MCP endpoint hit before handler ready")
+            return {
+                "status": 503,
+                "headers": {"Content-Type": "application/json"},
+                "content": json.dumps({"error": "mcp_not_ready"}),
+            }
+        http_method = (action.props.get("incoming_request_method") or "POST").upper()
+        headers = dict(action.props.get("headers", indigo.Dict()))
+        body_raw = action.props.get("request_body", "")
+        # IWS hands us bytes for some requests, str for others. Normalise.
+        if isinstance(body_raw, (bytes, bytearray)):
+            try:
+                body = body_raw.decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+        else:
+            body = body_raw or ""
+        try:
+            return self.mcp.handle_request(http_method, headers, body)
+        except Exception as exc:
+            self.logger.exception(f"MCP handler raised: {exc}")
+            return {
+                "status": 500,
+                "headers": {"Content-Type": "application/json"},
+                "content": json.dumps({"error": str(exc)}),
+            }
 
     def handle_run_digest(self, action, dev=None, callerWaitingForResult=None):
         """Programmatic entrypoint for a digest run. Wraps DigestRunner.run
