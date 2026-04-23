@@ -63,12 +63,13 @@ def register_all(
     safety_check: Optional[Callable[[int], bool]] = None,
     send_confirmation: Optional[Callable[[dict, str, dict], None]] = None,
     send_rejection: Optional[Callable[[dict, int], None]] = None,
+    after_write: Optional[Callable[[], None]] = None,
 ) -> None:
     """Register all read + write tools + resources on the given
     MCPHandler.
 
-    The three optional callables are what the write tools need
-    (propose_rule / add_rule):
+    The four optional callables are what the write tools need
+    (propose_rule / add_rule / update_rule):
 
     - ``safety_check(device_id) -> bool`` — mirrors plugin's
       ``_is_safe_rule_target``; returns True only for rule targets
@@ -78,6 +79,11 @@ def register_all(
       confirmation-email template used by the email-YES flow.
     - ``send_rejection(observation, target_device_id)`` — rejection
       email used when the safety gate refuses a write.
+    - ``after_write()`` — fired after every successful rule mutation
+      (add_rule, update_rule). Plugin wires this to
+      ``_refresh_state_variables`` so the Indigo state vars
+      (``hi_active_rules`` etc.) stay in sync with chat-initiated
+      changes the same way they do with menu-initiated ones.
     """
     _register_get_rules(handler, rule_store=rule_store)
     _register_get_observations(handler, observation_store=observation_store)
@@ -100,10 +106,12 @@ def register_all(
             safety_check=safety_check,
             send_confirmation=send_confirmation,
             send_rejection=send_rejection,
+            after_write=after_write,
             logger=logger,
         )
         _register_update_rule(
-            handler, rule_store=rule_store, logger=logger,
+            handler, rule_store=rule_store,
+            after_write=after_write, logger=logger,
         )
 
 
@@ -516,7 +524,7 @@ def _register_propose_rule(handler, *, safety_check) -> None:
             return {
                 "ok": False,
                 "stage": "safety",
-                "error": "target device is on the safety allowlist",
+                "error": "target device is refused by the safety allowlist",
                 "target_device_id": target_id,
                 "allowlist_rationale": (
                     "Safe rule targets are dimmers, relays, or smart plugs. "
@@ -566,6 +574,7 @@ def _register_add_rule(
     safety_check,
     send_confirmation,
     send_rejection,
+    after_write,
     logger,
 ) -> None:
     def add_rule(rule: dict, from_observation_id: Optional[str] = None) -> dict:
@@ -606,7 +615,7 @@ def _register_add_rule(
             return {
                 "ok": False,
                 "stage": "safety",
-                "error": "target device is on the safety allowlist",
+                "error": "target device is refused by the safety allowlist",
                 "target_device_id": target_id,
             }
 
@@ -632,6 +641,16 @@ def _register_add_rule(
                 send_confirmation(shell, rule_id, rule)
             except Exception as exc:
                 logger.exception(f"send_confirmation email failed: {exc}")
+
+        # Keep the plugin's Indigo state variables in sync with the
+        # rule store — menu path calls the same refresh hook after
+        # mutations. Best-effort; a failure here doesn't invalidate
+        # the rule itself.
+        if after_write is not None:
+            try:
+                after_write()
+            except Exception as exc:
+                logger.exception(f"after_write hook failed: {exc}")
 
         return {"ok": True, "rule_id": rule_id}
 
@@ -669,7 +688,7 @@ def _register_add_rule(
     )
 
 
-def _register_update_rule(handler, *, rule_store, logger) -> None:
+def _register_update_rule(handler, *, rule_store, after_write, logger) -> None:
     def update_rule(rule_id: str, action: str) -> dict:
         if not isinstance(rule_id, str) or not rule_id.strip():
             raise ValueError("rule_id must be a non-empty string")
@@ -698,6 +717,11 @@ def _register_update_rule(handler, *, rule_store, logger) -> None:
             rule_store.delete_rule(rule_id)
 
         logger.info(f"MCP update_rule: {action} on {rule_id}")
+        if after_write is not None:
+            try:
+                after_write()
+            except Exception as exc:
+                logger.exception(f"after_write hook failed: {exc}")
         return {"ok": True, "rule_id": rule_id, "action": action}
 
     handler.register_tool(

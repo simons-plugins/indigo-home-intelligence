@@ -289,9 +289,13 @@ class Plugin(indigo.PluginBase):
             # ADR-0006 allowlist on every rule-write path; the email
             # helpers reuse the email-YES templates so chat-initiated
             # and email-initiated rules leave an identical audit trail.
+            # after_write keeps the Indigo state variables in sync
+            # with chat-initiated mutations the same way menuManageRule
+            # does after menu-initiated ones.
             safety_check=_is_safe_rule_target,
             send_confirmation=self._send_rule_confirmation,
             send_rejection=self._send_rule_rejection,
+            after_write=self._refresh_state_variables,
         )
 
     # ------------------------------------------------------------------

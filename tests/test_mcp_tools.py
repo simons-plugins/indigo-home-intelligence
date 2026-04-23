@@ -473,18 +473,28 @@ def _valid_rule(description="nightly off"):
     }
 
 
+@pytest.fixture
+def fake_plugin_module(monkeypatch):
+    """Install a minimal `plugin` module into sys.modules with the
+    symbols mcp_tools' write tools import at runtime. monkeypatch
+    restores sys.modules after the test — avoids cross-test leaks and
+    order-dependence when the real `plugin` module eventually imports
+    something that needs Indigo stubs."""
+    import sys
+    import types
+
+    mod = types.ModuleType("plugin")
+    mod._render_rule_human = lambda rule: f"preview of {rule.get('description')}"
+    monkeypatch.setitem(sys.modules, "plugin", mod)
+    return mod
+
+
 class TestProposeRule:
     def _register(self, handler, safety_check=lambda _id: True):
         import mcp_tools
         mcp_tools._register_propose_rule(handler, safety_check=safety_check)
 
-    def test_valid_rule_returns_preview(self, handler):
-        # Need to monkey-patch _render_rule_human because its
-        # implementation lives on plugin.py and imports indigo.
-        import mcp_tools, sys, types
-        fake_plugin = types.ModuleType("plugin")
-        fake_plugin._render_rule_human = lambda rule: f"preview of {rule['description']}"
-        sys.modules["plugin"] = fake_plugin
+    def test_valid_rule_returns_preview(self, handler, fake_plugin_module):
         self._register(handler, safety_check=lambda _id: True)
         body = _call_tool(handler, "propose_rule", {"rule": _valid_rule()})
         payload = json.loads(body["result"]["content"][0]["text"])
@@ -523,13 +533,8 @@ class TestAddRule:
     def _register(self, handler, *, safety_check=lambda _id: True,
                   rule_store=None, observation_store=None,
                   send_confirmation=None, send_rejection=None,
-                  logger=None):
-        import mcp_tools, sys, types
-        # Stub plugin._render_rule_human to keep import cheap.
-        if "plugin" not in sys.modules:
-            sys.modules["plugin"] = types.ModuleType("plugin")
-        sys.modules["plugin"]._render_rule_human = lambda rule: "preview"
-
+                  after_write=None, logger=None):
+        import mcp_tools
         mcp_tools._register_add_rule(
             handler,
             rule_store=rule_store or _CapturingRuleStore(),
@@ -537,6 +542,7 @@ class TestAddRule:
             safety_check=safety_check,
             send_confirmation=send_confirmation,
             send_rejection=send_rejection,
+            after_write=after_write,
             logger=logger or logging.getLogger("test-add-rule"),
         )
 
@@ -645,7 +651,7 @@ class TestAddRule:
 
 
 class TestUpdateRule:
-    def _register(self, handler, rules=None):
+    def _register(self, handler, rules=None, after_write=None):
         import mcp_tools
         store = _CapturingRuleStore(rules or [
             {"id": "r1", "enabled": True, "description": "noon off"},
@@ -654,7 +660,9 @@ class TestUpdateRule:
              "auto_disabled_at": "2026-04-22T10:00:00", "description": "x"},
         ])
         mcp_tools._register_update_rule(
-            handler, rule_store=store, logger=logging.getLogger("test-update"),
+            handler, rule_store=store,
+            after_write=after_write,
+            logger=logging.getLogger("test-update"),
         )
         return store
 
@@ -691,3 +699,15 @@ class TestUpdateRule:
         self._register(handler)
         body = _call_tool(handler, "update_rule", {"rule_id": "r1", "action": "frobnicate"})
         assert body["result"]["isError"] is True
+
+    def test_successful_mutation_fires_after_write_hook(self, handler):
+        import mcp_tools
+        store = _CapturingRuleStore([{"id": "r1", "enabled": True, "description": "x"}])
+        hits = []
+        mcp_tools._register_update_rule(
+            handler, rule_store=store,
+            after_write=lambda: hits.append("refresh"),
+            logger=logging.getLogger("test-after-write"),
+        )
+        _call_tool(handler, "update_rule", {"rule_id": "r1", "action": "disable"})
+        assert hits == ["refresh"]
