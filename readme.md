@@ -64,16 +64,78 @@ stateless JSON-RPC 2.0; authentication rides on Indigo's reflector
 
 - `home-intelligence:digest_instructions` — the reasoning guide the weekly digest runs Claude under. Fetch this when asking for digest-style output mid-week.
 
-### Claude Desktop config
+### Setup: Claude Desktop with both MCPs
 
-Edit `~/Library/Application Support/Claude/claude_desktop_config.json` and
-add the plugin alongside any other MCP servers you use (mlamoure's
-`indigo-mcp-server` is the natural companion — it covers device
-control / state queries / the general Indigo object model):
+Home Intelligence is designed to work **alongside**
+[`mlamoure/indigo-mcp-server`](https://github.com/mlamoure/indigo-mcp-server),
+not replace it. mlamoure covers the general Indigo surface
+(device control, state queries, action groups, event log,
+semantic search). HI covers everything that requires plugin-owned
+state: SQL Logger history, agent rules, observations, curated
+digest context, digest-reasoning resource. The two surfaces are
+deliberately non-overlapping, and Claude composes across both
+when a question needs it.
+
+The full setup has four steps. Skip step 1 if you only want HI
+(you lose device control from chat but HI's tools still work).
+
+#### 1. Install mlamoure's Indigo MCP Server plugin
+
+1. Download `Indigo MCP Server.indigoPlugin.zip` from
+   [github.com/mlamoure/indigo-mcp-server/releases](https://github.com/mlamoure/indigo-mcp-server/releases).
+2. Double-click to install in Indigo.
+3. In Plugin Configure, enter your **OpenAI API key** — mlamoure's
+   plugin uses it for semantic search over devices/variables.
+4. Add a new **MCP Server** device in Indigo (Devices → New →
+   MCP Server → MCP Server). There can only be one per install.
+5. Wait for the first vector-store sync to complete (check the
+   Event Log — it announces "synchronized N entities in Xs").
+
+#### 2. Install Home Intelligence (this plugin)
+
+1. Download `Home Intelligence.indigoPlugin.zip` from this repo's
+   releases, double-click to install.
+2. Configure SQL Logger access + Anthropic API key (optional, for
+   the scheduled email) + SMTP (optional, same).
+3. No MCP-specific setup — the `/mcp` endpoint becomes live on
+   plugin startup.
+
+#### 3. Get a Reflector API key
+
+Both plugins authenticate MCP requests at the Indigo Web Server
+layer using a Bearer token. The easiest source is a Reflector
+API key (works remotely too):
+
+**Indigo → File → Preferences → Web Server → Reflector tab →
+API Keys** → click "+" to add one. Label it `claude-desktop`.
+Copy the value.
+
+LAN-only alternative: Indigo's `secrets.json` file. See
+`mlamoure/indigo-mcp-server`'s README §Authentication for that
+path — the `Authorization: Bearer <token>` scheme is the same, but
+the URL becomes `http://<host>:8176/...` with `--allow-http` in
+the args.
+
+#### 4. Edit Claude Desktop config
+
+Edit `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 ```json
 {
   "mcpServers": {
+    "indigo": {
+      "command": "/opt/homebrew/bin/npx",
+      "args": [
+        "-y",
+        "mcp-remote",
+        "https://<your-reflector>.indigodomo.net/message/com.vtmikel.mcp_server/mcp/",
+        "--header",
+        "Authorization:Bearer <your-reflector-api-key>"
+      ],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+      }
+    },
     "home-intelligence": {
       "command": "/opt/homebrew/bin/npx",
       "args": [
@@ -91,30 +153,50 @@ control / state queries / the general Indigo object model):
 }
 ```
 
-Replace `<your-reflector>` with your Indigo Reflector hostname and
-`<your-reflector-api-key>` with a key from
-**Indigo → Preferences → Web Server → Reflector → API Keys**.
+Replace in both entries:
+- `<your-reflector>` — your Indigo Reflector hostname (e.g. `clarkcastle.indigodomo.net`).
+- `<your-reflector-api-key>` — the key from step 3. Same key works for both plugins.
 
-For LAN-only use (no reflector), swap the URL for
-`http://jarvis.local:8176/message/com.simons-plugins.home-intelligence/mcp`
-and add `"--allow-http"` to the args before `--header`; the Bearer
-token then comes from `secrets.json` (Indigo's local secret file), not
-the reflector API keys.
+Gotchas:
+- **Trailing slash mismatch is real.** mlamoure's endpoint is
+  `/mcp/` (with slash); HI's is `/mcp` (no slash). Each matches its
+  plugin's `Actions.xml` declaration; swapping returns 404.
+- **`command` must point at the Homebrew-installed npx** and
+  `env.PATH` must omit nvm's node directories. See the
+  Troubleshooting section below for why.
 
-Restart Claude Desktop after editing (`⌘Q` then relaunch — close-window
-doesn't reload MCP servers). On startup it will call the `initialize`
-handshake and list the tools + resource above.
+Then `⌘Q` Claude Desktop and relaunch (close-window doesn't reload
+MCP servers). Both servers should negotiate `initialize` on
+startup, after which the tools pane (hammer icon bottom-left) will
+show both `indigo:*` tools and `home-intelligence:*` tools.
 
-Example: "what rules has Home Intelligence flagged so far?" →
-Claude calls `get_rules` and narrates.
+#### First things to try
+
+- *"Using Home Intelligence, what rules has the plugin flagged so far?"* →
+  calls `home-intelligence:get_rules`.
+- *"What happened with the dining TRV this week?"* →
+  Claude will likely use `indigo:search_entities` to find it, then
+  `home-intelligence:query_sql_logger` for its 7-day history.
+- *"Run me a mid-week digest."* →
+  reads `home-intelligence:digest_instructions` resource + calls
+  `home-intelligence:house_context_snapshot`. Same reasoning
+  substrate as Sunday's email, no API spend.
+- *"Turn off the study lamp."* → mlamoure's territory
+  (`indigo:device_turn_off`); HI doesn't duplicate device control.
 
 #### Troubleshooting
 
-**`ReferenceError: ReadableStream is not defined` in `~/Library/Logs/Claude/mcp-server-home-intelligence.log`**
+Claude Desktop writes per-server logs to
+`~/Library/Logs/Claude/mcp-server-<name>.log` — always the first
+place to look.
+
+**`ReferenceError: ReadableStream is not defined`**
 — Claude Desktop's launcher walks PATH for `node` and will happily
 pick an nvm-installed Node 16, which doesn't expose `ReadableStream`
 as a global. `mcp-remote`'s `undici` dependency then crashes on
-import and the MCP process dies before any request is sent.
+import and the MCP process dies before any request is sent. *Both*
+servers fail this way if nvm Node 16 is ahead of Homebrew Node on
+PATH.
 
 Fix: pin the `command` to `/opt/homebrew/bin/npx` **and** set `env.PATH`
 so the shebang (`#!/usr/bin/env node`) finds Homebrew's Node first,
@@ -123,17 +205,26 @@ directories deliberately.
 
 **"Server disconnected" with nothing in the plugin log**
 — The request is dying in mcp-remote before it hits the network.
-Usually the Node-version issue above. The Indigo plugin log
-(`Indigo → Window → Event Log`, filter on "Home Intelligence") will
-be silent; Claude Desktop's own log at
-`~/Library/Logs/Claude/mcp-server-home-intelligence.log` has the
-real stack trace.
+Usually the Node-version issue above. The Indigo plugin event log
+(`Indigo → Window → Event Log`, filter on plugin name) will be
+silent; Claude Desktop's own log has the real stack trace.
+
+**mlamoure's indigo shows "Stopped"**
+— mlamoure's plugin only serves MCP when his `MCP Server` Indigo
+device is in the `Running` state. Check the device in Indigo and
+run through its Config UI to start it. This plugin (HI) has no
+device dependency.
 
 **401 / 403 from the reflector**
 — Wrong token type. Reflector API keys and `secrets.json` local
 secrets are different credential classes and are validated against
 different code paths. Reflector URL wants the reflector API key;
 LAN URL wants the local secret.
+
+**Trailing slash 404**
+— Gotcha between the two plugins: mlamoure's endpoint is
+`/mcp/` with a trailing slash, HI's is `/mcp` without. Swapping
+either way returns 404 from IWS.
 
 ## Architecture
 
