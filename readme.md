@@ -75,27 +75,65 @@ control / state queries / the general Indigo object model):
 {
   "mcpServers": {
     "home-intelligence": {
-      "command": "npx",
+      "command": "/opt/homebrew/bin/npx",
       "args": [
         "-y",
         "mcp-remote",
-        "http://jarvis.local:8176/message/com.simons-plugins.home-intelligence/mcp"
-      ]
+        "https://<your-reflector>.indigodomo.net/message/com.simons-plugins.home-intelligence/mcp",
+        "--header",
+        "Authorization:Bearer <your-reflector-api-key>"
+      ],
+      "env": {
+        "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+      }
     }
   }
 }
 ```
 
-Swap the URL for your Indigo Reflector address
-(`https://<yours>.indigodomo.net/message/com.simons-plugins.home-intelligence/mcp`)
-if you want to reach the plugin away from home — reflector auth
-replaces LAN trust in that case.
+Replace `<your-reflector>` with your Indigo Reflector hostname and
+`<your-reflector-api-key>` with a key from
+**Indigo → Preferences → Web Server → Reflector → API Keys**.
 
-Restart Claude Desktop after editing. On startup it will call the
-`initialize` handshake and list the tools + resource above.
+For LAN-only use (no reflector), swap the URL for
+`http://jarvis.local:8176/message/com.simons-plugins.home-intelligence/mcp`
+and add `"--allow-http"` to the args before `--header`; the Bearer
+token then comes from `secrets.json` (Indigo's local secret file), not
+the reflector API keys.
+
+Restart Claude Desktop after editing (`⌘Q` then relaunch — close-window
+doesn't reload MCP servers). On startup it will call the `initialize`
+handshake and list the tools + resource above.
 
 Example: "what rules has Home Intelligence flagged so far?" →
 Claude calls `get_rules` and narrates.
+
+#### Troubleshooting
+
+**`ReferenceError: ReadableStream is not defined` in `~/Library/Logs/Claude/mcp-server-home-intelligence.log`**
+— Claude Desktop's launcher walks PATH for `node` and will happily
+pick an nvm-installed Node 16, which doesn't expose `ReadableStream`
+as a global. `mcp-remote`'s `undici` dependency then crashes on
+import and the MCP process dies before any request is sent.
+
+Fix: pin the `command` to `/opt/homebrew/bin/npx` **and** set `env.PATH`
+so the shebang (`#!/usr/bin/env node`) finds Homebrew's Node first,
+not nvm's. The config block above already does this; omit the nvm
+directories deliberately.
+
+**"Server disconnected" with nothing in the plugin log**
+— The request is dying in mcp-remote before it hits the network.
+Usually the Node-version issue above. The Indigo plugin log
+(`Indigo → Window → Event Log`, filter on "Home Intelligence") will
+be silent; Claude Desktop's own log at
+`~/Library/Logs/Claude/mcp-server-home-intelligence.log` has the
+real stack trace.
+
+**401 / 403 from the reflector**
+— Wrong token type. Reflector API keys and `secrets.json` local
+secrets are different credential classes and are validated against
+different code paths. Reflector URL wants the reflector API key;
+LAN URL wants the local secret.
 
 ## Architecture
 
