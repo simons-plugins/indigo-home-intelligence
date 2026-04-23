@@ -15,12 +15,11 @@ Architectural decisions:
 """
 
 import json
-import secrets
-import traceback
 from datetime import datetime, timezone
 
 import indigo
 
+from data_access import HouseContextAccess
 from history_db import HistoryDB
 from rule_store import RuleStore
 from rule_evaluator import RuleEvaluator
@@ -28,6 +27,8 @@ from observation_store import ObservationStore
 from digest import DigestRunner
 from delivery import DeliveryClient
 from inbox import InboxPoller, InboxPollError
+from mcp_handler import MCPHandler
+import mcp_tools
 
 
 DAYS_OF_WEEK = {
@@ -185,6 +186,8 @@ class Plugin(indigo.PluginBase):
         self.digest = None
         self.delivery = None
         self.inbox = None
+        self.mcp = None
+        self.context = None
         self._last_eval_at = 0.0
         self._last_inbox_poll_at = 0.0
         self._last_digest_date = None
@@ -225,7 +228,6 @@ class Plugin(indigo.PluginBase):
     def _rebuild_clients(self):
         """Construct DeliveryClient, InboxPoller, and DigestRunner from current
         pluginPrefs. Called from startup() and closedPrefsConfigUi()."""
-        hmac_secret = self._ensure_internal_hmac_secret()
         self.delivery = DeliveryClient(
             smtp_host=self.pluginPrefs.get("smtpHost", ""),
             smtp_port=self.pluginPrefs.get("smtpPort", "465"),
@@ -233,7 +235,6 @@ class Plugin(indigo.PluginBase):
             smtp_password=self.pluginPrefs.get("smtpPassword", ""),
             from_address=self.pluginPrefs.get("smtpFromAddress", ""),
             default_to=self.pluginPrefs.get("digestEmailTo", ""),
-            hmac_secret=hmac_secret,
             smtp_use_ssl=_as_bool(self.pluginPrefs.get("smtpUseSsl"), True),
             logger=self.logger,
         )
@@ -247,14 +248,8 @@ class Plugin(indigo.PluginBase):
             imap_use_ssl=_as_bool(self.pluginPrefs.get("imapUseSsl"), True),
             logger=self.logger,
         )
-        self.digest = DigestRunner(
+        self.context = HouseContextAccess(
             history_db=self.history_db,
-            rule_store=self.rule_store,
-            observation_store=self.observation_store,
-            delivery=self.delivery,
-            api_key=self.pluginPrefs.get("anthropicApiKey", ""),
-            model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
-            email_to=self.pluginPrefs.get("digestEmailTo", ""),
             logger=self.logger,
             whole_house_energy_device_id=_as_optional_int(
                 self.pluginPrefs.get("wholeHouseEnergyDeviceId")
@@ -268,6 +263,31 @@ class Plugin(indigo.PluginBase):
                 24, min_value=0, max_value=168,
             ),
         )
+        self.digest = DigestRunner(
+            context=self.context,
+            rule_store=self.rule_store,
+            observation_store=self.observation_store,
+            delivery=self.delivery,
+            api_key=self.pluginPrefs.get("anthropicApiKey", ""),
+            model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
+            email_to=self.pluginPrefs.get("digestEmailTo", ""),
+            logger=self.logger,
+        )
+        self.mcp = MCPHandler(
+            logger=self.logger,
+            server_name="home-intelligence",
+            server_version=self.pluginVersion,
+        )
+        mcp_tools.register_all(
+            self.mcp,
+            context=self.context,
+            rule_store=self.rule_store,
+            observation_store=self.observation_store,
+            history_db=self.history_db,
+            logger=self.logger,
+        )
+        # Resource registration (digest_instructions) lands in the next
+        # commit.
 
     # ------------------------------------------------------------------
     # Main loop
@@ -563,6 +583,39 @@ class Plugin(indigo.PluginBase):
                 snapshot["observations_error"] = str(exc)
         return snapshot
 
+    def handle_mcp(self, action, dev=None, callerWaitingForResult=None):
+        """IWS entry point for the MCP endpoint at
+        ``POST /message/<plugin-id>/mcp``. Extracts HTTP method, headers,
+        and body from the incoming action and delegates to MCPHandler,
+        which returns the IWS-shaped response dict."""
+        if self.mcp is None:
+            self.logger.error("MCP endpoint hit before handler ready")
+            return {
+                "status": 503,
+                "headers": {"Content-Type": "application/json"},
+                "content": json.dumps({"error": "mcp_not_ready"}),
+            }
+        http_method = (action.props.get("incoming_request_method") or "POST").upper()
+        headers = dict(action.props.get("headers", indigo.Dict()))
+        body_raw = action.props.get("request_body", "")
+        # IWS hands us bytes for some requests, str for others. Normalise.
+        if isinstance(body_raw, (bytes, bytearray)):
+            try:
+                body = body_raw.decode("utf-8", errors="replace")
+            except Exception:
+                body = ""
+        else:
+            body = body_raw or ""
+        try:
+            return self.mcp.handle_request(http_method, headers, body)
+        except Exception as exc:
+            self.logger.exception(f"MCP handler raised: {exc}")
+            return {
+                "status": 500,
+                "headers": {"Content-Type": "application/json"},
+                "content": json.dumps({"error": str(exc)}),
+            }
+
     def handle_run_digest(self, action, dev=None, callerWaitingForResult=None):
         """Programmatic entrypoint for a digest run. Wraps DigestRunner.run
         so callers outside the plugin (Action Groups, HTTP, scripts) can
@@ -590,40 +643,8 @@ class Plugin(indigo.PluginBase):
         self._refresh_state_variables()
         return {"status": "ok", "reply_id": result}
 
-    def handle_feedback(self, action, dev=None, callerWaitingForResult=None):
-        """IWS HTTP entrypoint — parses the JSON body, verifies the
-        X-HI-Signature HMAC, and delegates to _dispatch_feedback.
-
-        Currently has no in-tree callers: the inbox poller calls
-        _dispatch_feedback directly in-process. Kept for future
-        out-of-process signal sources (iMessage plugin, shortcuts hook,
-        webhook). Deletion criterion: remove if no such caller arrives
-        after a reasonable interval, and simplify to keep only the
-        in-process path."""
-        try:
-            body_props = action.props.get("body_params", indigo.Dict()) or indigo.Dict()
-            raw_body = action.props.get("request_body", b"")
-            if isinstance(raw_body, bytes):
-                raw_body = raw_body.decode("utf-8", errors="replace")
-            payload = json.loads(raw_body) if raw_body else dict(body_props)
-
-            signature = (
-                action.props.get("headers", indigo.Dict()).get("X-HI-Signature")
-                or payload.pop("signature", None)
-            )
-            if not self.delivery.verify_signature(payload, signature):
-                self.logger.warning("Feedback webhook: invalid signature")
-                return {"status": "unauthorized"}
-
-            return self._dispatch_feedback(payload)
-        except Exception as exc:
-            self.logger.exception(f"handle_feedback failed: {exc}")
-            return {"status": "error", "detail": traceback.format_exc(limit=2)}
-
     def _dispatch_feedback(self, payload: dict) -> dict:
-        """Process a decoded feedback payload. Called directly by the inbox
-        poller (same process, no HMAC needed) and via handle_feedback for
-        HTTP callers.
+        """Process a decoded feedback payload from the inbox poller.
 
         Contract: returns a dict with a `status` key. Any status other
         than 'ok' or 'accepted' causes the inbox poller to leave the
@@ -979,22 +1000,3 @@ class Plugin(indigo.PluginBase):
         )
         self.observation_store.ensure_variable_exists()
 
-    def _ensure_internal_hmac_secret(self) -> str:
-        """Generate and persist the HMAC secret used by handle_feedback to
-        authenticate external HTTP callers on the IWS /feedback endpoint.
-        Not user-configurable. Stored in pluginPrefs so it survives
-        restarts; rotating it requires clearing that pref. The in-process
-        inbox poller bypasses the IWS endpoint entirely, so this secret
-        is dead weight today but kept for future out-of-process channels
-        (iMessage plugin, webhook, shortcut)."""
-        secret = self.pluginPrefs.get("internalHmacSecret", "")
-        if secret:
-            return secret
-        secret = secrets.token_hex(32)
-        self.pluginPrefs["internalHmacSecret"] = secret
-        try:
-            indigo.server.savePluginPrefs()
-        except Exception as exc:
-            self.logger.warning(f"Could not persist internal HMAC secret: {exc}")
-        self.logger.info("Generated internal HMAC secret for /feedback endpoint")
-        return secret

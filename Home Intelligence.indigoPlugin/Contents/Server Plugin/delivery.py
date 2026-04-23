@@ -1,6 +1,5 @@
 """
-Delivery client - SMTP digest sender + HMAC helpers for the IWS
-/feedback endpoint.
+Delivery client - SMTP digest sender.
 
 Per workspace ADR-0002 (~/vsCodeProjects/Indigo/docs/adr/0002-*), the
 Home Intelligence feedback loop uses the user's own SMTP and IMAP
@@ -12,13 +11,6 @@ In-Reply-To header threads them back to the correct observation. An
 X-HI-Reply-Id header and a [obs-<id>] subject tag act as fallbacks
 when a mail client mangles the Message-ID.
 
-The HMAC helpers sign/verify payloads for plugin.py::handle_feedback,
-the HTTP entrypoint on Indigo's IWS. The in-process inbox poller
-bypasses that endpoint and calls _dispatch_feedback directly, so the
-helpers exist purely for external callers (an iMessage plugin, a
-webhook, etc.). The secret is auto-generated on first startup and not
-user-configurable.
-
 SMTP failure handling distinguishes permanent (auth, bad recipient —
 5xx) from transient (network, server disconnect — retriable) so the
 caller can decide whether to roll back the observation that was
@@ -26,9 +18,6 @@ persisted pre-send.
 """
 
 import email.utils
-import hashlib
-import hmac
-import json
 import smtplib
 import socket
 import ssl
@@ -45,7 +34,6 @@ class DeliveryClient:
         smtp_password: str,
         from_address: str,
         default_to: str,
-        hmac_secret: str,
         logger,
         smtp_use_ssl: bool = True,
     ):
@@ -55,7 +43,6 @@ class DeliveryClient:
         self.smtp_password = smtp_password
         self.from_address = from_address or smtp_user
         self.default_to = default_to
-        self.hmac_secret = hmac_secret
         self.logger = logger
         self.smtp_use_ssl = smtp_use_ssl
 
@@ -182,22 +169,6 @@ class DeliveryClient:
         except Exception as exc:
             self.logger.exception(f"SMTP send failed (unclassified) to {recipient}: {exc}")
             return "transient"
-
-    # ------------------------------------------------------------------
-    # HMAC helpers for /feedback
-    # ------------------------------------------------------------------
-
-    def sign(self, payload: dict) -> str:
-        raw = json.dumps(payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
-        return hmac.new(
-            self.hmac_secret.encode("utf-8"), raw, hashlib.sha256
-        ).hexdigest()
-
-    def verify_signature(self, payload: dict, signature: Optional[str]) -> bool:
-        if not signature or not self.hmac_secret:
-            return False
-        expected = self.sign(payload)
-        return hmac.compare_digest(expected, signature)
 
     # ------------------------------------------------------------------
     # Helpers

@@ -55,8 +55,7 @@ if "indigo" not in sys.modules:
     stub.PluginBase = _PluginBase
 
     # indigo.Dict is used in places like Actions.xml body parsing.
-    # A plain dict subclass is behaviour-equivalent for the tests
-    # that never run handle_feedback directly.
+    # A plain dict subclass is behaviour-equivalent for test code paths.
     stub.Dict = dict
 
     sys.modules["indigo"] = stub
