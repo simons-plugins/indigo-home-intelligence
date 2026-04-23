@@ -285,9 +285,14 @@ class Plugin(indigo.PluginBase):
             observation_store=self.observation_store,
             history_db=self.history_db,
             logger=self.logger,
+            # Write-tool dependencies. _is_safe_rule_target enforces the
+            # ADR-0006 allowlist on every rule-write path; the email
+            # helpers reuse the email-YES templates so chat-initiated
+            # and email-initiated rules leave an identical audit trail.
+            safety_check=_is_safe_rule_target,
+            send_confirmation=self._send_rule_confirmation,
+            send_rejection=self._send_rule_rejection,
         )
-        # Resource registration (digest_instructions) lands in the next
-        # commit.
 
     # ------------------------------------------------------------------
     # Main loop
