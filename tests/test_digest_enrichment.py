@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from digest import DigestRunner
+from data_access import HouseContextAccess
 
 
 # ---------------------------------------------------------------------
@@ -66,41 +66,41 @@ class CaptureLogger:
 
 class TestJsonable:
     def test_primitives_unchanged(self):
-        assert DigestRunner._jsonable(None) is None
-        assert DigestRunner._jsonable(True) is True
-        assert DigestRunner._jsonable(42) == 42
-        assert DigestRunner._jsonable(3.14) == 3.14
-        assert DigestRunner._jsonable("hello") == "hello"
+        assert HouseContextAccess._jsonable(None) is None
+        assert HouseContextAccess._jsonable(True) is True
+        assert HouseContextAccess._jsonable(42) == 42
+        assert HouseContextAccess._jsonable(3.14) == 3.14
+        assert HouseContextAccess._jsonable("hello") == "hello"
 
     def test_false_and_zero_primitives(self):
         # Critical: False/0 pass through, not treated as empty signals.
-        assert DigestRunner._jsonable(False) is False
-        assert DigestRunner._jsonable(0) == 0
+        assert HouseContextAccess._jsonable(False) is False
+        assert HouseContextAccess._jsonable(0) == 0
 
     def test_list_coerces_elements(self):
-        assert DigestRunner._jsonable([1, "a", None]) == [1, "a", None]
+        assert HouseContextAccess._jsonable([1, "a", None]) == [1, "a", None]
 
     def test_tuple_becomes_list(self):
-        assert DigestRunner._jsonable((1, 2, 3)) == [1, 2, 3]
+        assert HouseContextAccess._jsonable((1, 2, 3)) == [1, 2, 3]
 
     def test_nested_dict(self):
-        result = DigestRunner._jsonable({"a": 1, "b": {"c": 2}})
+        result = HouseContextAccess._jsonable({"a": 1, "b": {"c": 2}})
         assert result == {"a": 1, "b": {"c": 2}}
 
     def test_dict_keys_stringified(self):
         # JSON can't represent non-string keys; helper must cast.
-        result = DigestRunner._jsonable({1: "one", 2: "two"})
+        result = HouseContextAccess._jsonable({1: "one", 2: "two"})
         assert result == {"1": "one", "2": "two"}
 
     def test_exotic_type_falls_back_to_str(self):
         class Exotic:
             def __str__(self):
                 return "exotic-repr"
-        assert DigestRunner._jsonable(Exotic()) == "exotic-repr"
+        assert HouseContextAccess._jsonable(Exotic()) == "exotic-repr"
 
     def test_datetime_becomes_string(self):
         from datetime import datetime
-        result = DigestRunner._jsonable(datetime(2026, 4, 21, 10, 30))
+        result = HouseContextAccess._jsonable(datetime(2026, 4, 21, 10, 30))
         assert isinstance(result, str)
         assert "2026-04-21" in result
 
@@ -112,7 +112,7 @@ class TestJsonable:
                 self._data = data
             def items(self):
                 return self._data.items()
-        result = DigestRunner._jsonable(
+        result = HouseContextAccess._jsonable(
             MappingLike({"a": 1, "b": MappingLike({"c": 2})})
         )
         assert result == {"a": 1, "b": {"c": 2}}
@@ -125,7 +125,7 @@ class TestJsonable:
                 self._items = items
             def __iter__(self):
                 return iter(self._items)
-        result = DigestRunner._jsonable(
+        result = HouseContextAccess._jsonable(
             IterableLike([1, "two", IterableLike([3, 4])])
         )
         assert result == [1, "two", [3, 4]]
@@ -138,7 +138,7 @@ class TestJsonable:
                 raise RuntimeError("backend gone")
             def __str__(self):
                 return "broken-lazy"
-        assert DigestRunner._jsonable(BrokenLazy()) == "broken-lazy"
+        assert HouseContextAccess._jsonable(BrokenLazy()) == "broken-lazy"
 
     def test_misbehaving_dict_subclass_does_not_propagate(self):
         """The isinstance(dict) branch used to be unguarded. If an
@@ -148,7 +148,7 @@ class TestJsonable:
             def items(self):
                 raise RuntimeError("lazy backend")
         # Should not raise — degrades to str().
-        result = DigestRunner._jsonable(BadDictSubclass())
+        result = HouseContextAccess._jsonable(BadDictSubclass())
         assert isinstance(result, str)
 
     def test_misbehaving_list_subclass_does_not_propagate(self):
@@ -156,7 +156,7 @@ class TestJsonable:
         class BadList(list):
             def __iter__(self):
                 raise RuntimeError("lazy backend")
-        result = DigestRunner._jsonable(BadList([1, 2]))
+        result = HouseContextAccess._jsonable(BadList([1, 2]))
         assert isinstance(result, str)
 
 
@@ -168,24 +168,24 @@ class TestJsonable:
 class TestFilterKeys:
     def test_drop_list_removes_keys(self):
         d = {"keep": 1, "xmlElement": "<foo/>", "also_keep": 2}
-        result = DigestRunner._filter_keys(d, frozenset({"xmlElement"}))
+        result = HouseContextAccess._filter_keys(d, frozenset({"xmlElement"}))
         assert result == {"keep": 1, "also_keep": 2}
 
     def test_none_values_removed(self):
         d = {"name": "x", "missing": None, "val": 0}
-        result = DigestRunner._filter_keys(d, frozenset())
+        result = HouseContextAccess._filter_keys(d, frozenset())
         # 0 is a legitimate value, not "empty" — must be preserved.
         assert result == {"name": "x", "val": 0}
 
     def test_empty_collections_removed(self):
         d = {"name": "x", "empty_list": [], "empty_dict": {}, "empty_str": ""}
-        result = DigestRunner._filter_keys(d, frozenset())
+        result = HouseContextAccess._filter_keys(d, frozenset())
         assert result == {"name": "x"}
 
     def test_zero_and_false_preserved(self):
         # Edge case: 0 and False should NOT be treated as empty.
         d = {"count": 0, "flag": False, "enabled": True}
-        result = DigestRunner._filter_keys(d, frozenset())
+        result = HouseContextAccess._filter_keys(d, frozenset())
         assert result == {"count": 0, "flag": False, "enabled": True}
 
     def test_recurses_into_nested_dicts(self):
@@ -199,7 +199,7 @@ class TestFilterKeys:
                 "more_nested": {"xmlElement": "<even deeper/>", "keep": "me"},
             },
         }
-        result = DigestRunner._filter_keys(d, frozenset({"xmlElement"}))
+        result = HouseContextAccess._filter_keys(d, frozenset({"xmlElement"}))
         assert result == {
             "outer": 1,
             "pluginProps": {
@@ -216,14 +216,14 @@ class TestFilterKeys:
                 {"op": "off", "xmlElement": "<b/>"},
             ],
         }
-        result = DigestRunner._filter_keys(d, frozenset({"xmlElement"}))
+        result = HouseContextAccess._filter_keys(d, frozenset({"xmlElement"}))
         assert result == {"actions": [{"op": "on"}, {"op": "off"}]}
 
     def test_nested_becomes_empty_is_dropped(self):
         """If recursion empties a nested dict entirely, the now-empty
         parent key is dropped by the outer filter."""
         d = {"shell": {"xmlElement": "<only-this/>"}}
-        result = DigestRunner._filter_keys(d, frozenset({"xmlElement"}))
+        result = HouseContextAccess._filter_keys(d, frozenset({"xmlElement"}))
         assert result == {}
 
     def test_drops_none_from_jsonable_regression_guard(self):
@@ -232,7 +232,7 @@ class TestFilterKeys:
         will silently swallow the key. Documents the contract so an
         accidental change gets reviewed."""
         d = {"important_field": None}
-        assert DigestRunner._filter_keys(d, frozenset()) == {}
+        assert HouseContextAccess._filter_keys(d, frozenset()) == {}
 
 
 # ---------------------------------------------------------------------
@@ -247,14 +247,14 @@ class TestSafeIndigoDict:
                 return ["a", "b"]
             def __getitem__(self, key):
                 return {"a": 1, "b": "two"}[key]
-        result = DigestRunner._safe_indigo_dict(DictLike())
+        result = HouseContextAccess._safe_indigo_dict(DictLike())
         assert result == {"a": 1, "b": "two"}
 
     def test_keys_failure_returns_empty(self):
         class Unfriendly:
             def keys(self):
                 raise RuntimeError("cannot iterate")
-        result = DigestRunner._safe_indigo_dict(Unfriendly())
+        result = HouseContextAccess._safe_indigo_dict(Unfriendly())
         assert result == {}
 
     def test_getitem_partial_failure_returns_empty(self):
@@ -268,7 +268,7 @@ class TestSafeIndigoDict:
                 if key == "b":
                     raise RuntimeError("broken state ref")
                 return {"a": 1, "c": 3}[key]
-        assert DigestRunner._safe_indigo_dict(PartialFail()) == {}
+        assert HouseContextAccess._safe_indigo_dict(PartialFail()) == {}
 
     def test_dict_coercion_applies_jsonable(self):
         class WithExoticValue:
@@ -278,7 +278,7 @@ class TestSafeIndigoDict:
                 class Exotic:
                     def __str__(self): return "coerced"
                 return Exotic()
-        result = DigestRunner._safe_indigo_dict(WithExoticValue())
+        result = HouseContextAccess._safe_indigo_dict(WithExoticValue())
         assert result == {"special": "coerced"}
 
     def test_memory_error_propagates(self):
@@ -288,7 +288,7 @@ class TestSafeIndigoDict:
             def keys(self):
                 raise MemoryError("exhausted")
         with pytest.raises(MemoryError):
-            DigestRunner._safe_indigo_dict(OutOfMemory())
+            HouseContextAccess._safe_indigo_dict(OutOfMemory())
 
     def test_debug_logged_when_logger_provided(self):
         """Passing a logger surfaces silent degradation — without it
@@ -297,7 +297,7 @@ class TestSafeIndigoDict:
             def keys(self):
                 raise RuntimeError("broken")
         logger = CaptureLogger()
-        DigestRunner._safe_indigo_dict(Unfriendly(), logger=logger)
+        HouseContextAccess._safe_indigo_dict(Unfriendly(), logger=logger)
         assert len(logger.debug_calls) == 1
         assert "dict() coercion failed" in logger.debug_calls[0]
 
@@ -307,7 +307,7 @@ class TestSafeIndigoDict:
             def keys(self):
                 raise RuntimeError("broken")
         # Must not raise.
-        DigestRunner._safe_indigo_dict(Unfriendly())
+        HouseContextAccess._safe_indigo_dict(Unfriendly())
 
 
 # ---------------------------------------------------------------------
@@ -320,17 +320,17 @@ class TestExtras:
         """Hand-set id/name/enabled/type must not be clobbered by the
         dict()-coerced body."""
         base = {"id": 999, "name": "wrong", "enabled": "string-not-bool", "type": "X"}
-        result = DigestRunner._extras(base, frozenset())
+        result = HouseContextAccess._extras(base, frozenset())
         assert result == {}
 
     def test_strips_drop_list(self):
         base = {"keep": "me", "xmlElement": "<noise/>"}
-        result = DigestRunner._extras(base, frozenset({"xmlElement"}))
+        result = HouseContextAccess._extras(base, frozenset({"xmlElement"}))
         assert result == {"keep": "me"}
 
     def test_preserves_unrelated_fields(self):
         base = {"scheduleTime": "16:00:00", "folderId": 3}
-        result = DigestRunner._extras(base, frozenset())
+        result = HouseContextAccess._extras(base, frozenset())
         assert result == {"scheduleTime": "16:00:00", "folderId": 3}
 
 
@@ -359,7 +359,7 @@ class TestScheduleSnapshot:
 
     def test_standard_schedule_populates_from_dict(self):
         sched = self._fake_schedule()
-        snap = DigestRunner._schedule_snapshot(sched)
+        snap = HouseContextAccess._schedule_snapshot(sched)
         assert snap["id"] == 100
         assert snap["name"] == "Coffee Off 4pm"
         assert snap["enabled"] is True
@@ -370,7 +370,7 @@ class TestScheduleSnapshot:
 
     def test_schedule_without_description(self):
         sched = self._fake_schedule(description="")
-        snap = DigestRunner._schedule_snapshot(sched)
+        snap = HouseContextAccess._schedule_snapshot(sched)
         assert "description" not in snap
 
     def test_dict_coercion_failure_falls_back_to_getattr(self):
@@ -386,7 +386,7 @@ class TestScheduleSnapshot:
             scheduleTime = "09:00:00"
             def keys(self):
                 raise RuntimeError("breakage")
-        snap = DigestRunner._schedule_snapshot(BrokenSched())
+        snap = HouseContextAccess._schedule_snapshot(BrokenSched())
         assert snap["id"] == 999
         assert snap["name"] == "Broken"
         assert snap["enabled"] is True
@@ -407,7 +407,7 @@ class TestScheduleSnapshot:
             nextExecution = "22:30:00"
             def keys(self):
                 return []
-        snap = DigestRunner._schedule_snapshot(OddSchedule())
+        snap = HouseContextAccess._schedule_snapshot(OddSchedule())
         assert snap["nextExecution"] == "22:30:00"
         assert "scheduleTime" not in snap
 
@@ -419,7 +419,7 @@ class TestScheduleSnapshot:
             type="ShouldNotOverrideClassName",
             enabled="definitely-not-a-bool",
         )
-        snap = DigestRunner._schedule_snapshot(sched)
+        snap = HouseContextAccess._schedule_snapshot(sched)
         assert snap["type"] == "FakeSched"
         assert snap["enabled"] is True
 
@@ -445,7 +445,7 @@ class TestTriggerSnapshot:
             stateSelector="onOffState",
             stateValue="on",
         )
-        snap = DigestRunner._trigger_snapshot(t)
+        snap = HouseContextAccess._trigger_snapshot(t)
         assert snap["type"] == "DeviceStateChangeTrigger"
         assert snap["deviceId"] == 12345
         assert snap["stateSelector"] == "onOffState"
@@ -459,7 +459,7 @@ class TestTriggerSnapshot:
             variableId=55555,
             variableValue="1",
         )
-        snap = DigestRunner._trigger_snapshot(t)
+        snap = HouseContextAccess._trigger_snapshot(t)
         assert snap["type"] == "VariableValueChangeTrigger"
         assert snap["variableId"] == 55555
         assert snap["variableValue"] == "1"
@@ -471,7 +471,7 @@ class TestTriggerSnapshot:
             pluginId="com.example.someplugin",
             pluginTypeId="motionDetected",
         )
-        snap = DigestRunner._trigger_snapshot(t)
+        snap = HouseContextAccess._trigger_snapshot(t)
         assert snap["type"] == "PluginEventTrigger"
         assert snap["pluginId"] == "com.example.someplugin"
         assert snap["pluginTypeId"] == "motionDetected"
@@ -495,7 +495,7 @@ class TestTriggerSnapshot:
                 return ["id", "name", "enabled", "folderId"]
             def __getitem__(self, key):
                 return getattr(self, key)
-        snap = DigestRunner._trigger_snapshot(PartialDict())
+        snap = HouseContextAccess._trigger_snapshot(PartialDict())
         assert snap["deviceId"] == 99999
         assert snap["stateSelector"] == "onOffState"
         assert snap["stateValue"] is True
@@ -518,7 +518,7 @@ class TestActionGroupSnapshot:
 
     def test_standard_action_group(self):
         ag = self._fake_action_group()
-        snap = DigestRunner._action_group_snapshot(ag)
+        snap = HouseContextAccess._action_group_snapshot(ag)
         assert snap["id"] == 300
         assert snap["name"] == "Kitchen Lights On Auto Dim"
         assert snap["description"] == "Turn on kitchen lights to 50%"
@@ -533,7 +533,7 @@ class TestActionGroupSnapshot:
             folderId = 3
             def keys(self):
                 raise RuntimeError("bad")
-        snap = DigestRunner._action_group_snapshot(Broken())
+        snap = HouseContextAccess._action_group_snapshot(Broken())
         assert snap["id"] == 301
         assert snap["name"] == "Broken"
         assert snap["description"] == "fallback desc"
@@ -554,7 +554,7 @@ class TestSnapshotAll:
         _snapshot_all needs: self.logger. Avoids constructing the full
         DigestRunner (which needs a Claude client etc.)."""
         class Mini:
-            _snapshot_all = DigestRunner._snapshot_all
+            _snapshot_all = HouseContextAccess._snapshot_all
             logger = CaptureLogger()
         return Mini()
 
@@ -700,13 +700,13 @@ class TestIsRealDevice:
 
     def test_dimmer_is_real(self):
         dev = self._dev(brightness=80)
-        assert DigestRunner._is_real_device(dev) is True
+        assert HouseContextAccess._is_real_device(dev) is True
 
     def test_relay_is_real(self):
         dev = SimpleNamespace(
             pluginId="com.example.shelly", deviceTypeId="relay", onState=True
         )
-        assert DigestRunner._is_real_device(dev) is True
+        assert HouseContextAccess._is_real_device(dev) is True
 
     def test_thermostat_is_real(self):
         dev = SimpleNamespace(
@@ -714,7 +714,7 @@ class TestIsRealDevice:
             deviceTypeId="thermostat",
             temperatureInputs=[20.0],
         )
-        assert DigestRunner._is_real_device(dev) is True
+        assert HouseContextAccess._is_real_device(dev) is True
 
     def test_sensor_is_real(self):
         dev = SimpleNamespace(
@@ -722,7 +722,7 @@ class TestIsRealDevice:
             deviceTypeId="sensor",
             sensorValue=22.5,
         )
-        assert DigestRunner._is_real_device(dev) is True
+        assert HouseContextAccess._is_real_device(dev) is True
 
     def test_alexa_mirror_is_excluded(self):
         # Alexa Hue Bridge exposes a "real"-looking dimmer, but it's a
@@ -732,7 +732,7 @@ class TestIsRealDevice:
             deviceTypeId="dimmer",
             brightness=80,
         )
-        assert DigestRunner._is_real_device(dev) is False
+        assert HouseContextAccess._is_real_device(dev) is False
 
     def test_homekit_mirror_is_excluded(self):
         dev = SimpleNamespace(
@@ -740,7 +740,7 @@ class TestIsRealDevice:
             deviceTypeId="relay",
             onState=True,
         )
-        assert DigestRunner._is_real_device(dev) is False
+        assert HouseContextAccess._is_real_device(dev) is False
 
     def test_virtual_device_collection_is_excluded(self):
         dev = SimpleNamespace(
@@ -748,7 +748,7 @@ class TestIsRealDevice:
             deviceTypeId="computed",
             onState=True,
         )
-        assert DigestRunner._is_real_device(dev) is False
+        assert HouseContextAccess._is_real_device(dev) is False
 
     def test_shelly_button_child_is_excluded(self):
         # Shelly primary switches expose deviceTypeId="component-switch"
@@ -758,7 +758,7 @@ class TestIsRealDevice:
             deviceTypeId="component-button",
             onState=False,
         )
-        assert DigestRunner._is_real_device(dev) is False
+        assert HouseContextAccess._is_real_device(dev) is False
 
     def test_plain_virtual_device_without_capability_is_excluded(self):
         # Device slipping past plugin-id/type-id filters but having no
@@ -767,11 +767,11 @@ class TestIsRealDevice:
             pluginId="com.example.mystery",
             deviceTypeId="whatever",
         )
-        assert DigestRunner._is_real_device(dev) is False
+        assert HouseContextAccess._is_real_device(dev) is False
 
     def test_missing_attributes_default_sensibly(self):
         # A bare object with no pluginId/deviceTypeId but a real capability
         # should be kept (getattr defaults to "" which isn't in either
         # exclusion list).
         dev = SimpleNamespace(brightness=100)
-        assert DigestRunner._is_real_device(dev) is True
+        assert HouseContextAccess._is_real_device(dev) is True

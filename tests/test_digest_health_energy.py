@@ -1,4 +1,4 @@
-"""Tests for DigestRunner._fleet_health and ._energy_context — the two
+"""Tests for HouseContextAccess.fleet_health and .energy_context — the two
 new blocks added for PR #13.
 
 These touch ``indigo.devices`` (for battery/offline scans and name
@@ -13,7 +13,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-import digest
+import data_access
 
 
 class _FakeDevicesIterable(list):
@@ -25,7 +25,7 @@ class _FakeDevicesIterable(list):
 
 @pytest.fixture
 def patched_devices(monkeypatch):
-    """Factory that replaces ``digest.indigo.devices`` for one test.
+    """Factory that replaces ``data_access.indigo.devices`` for one test.
 
     ``raising=False`` bypasses the strict-stub's AttributeError on
     attribute check — the Tier-A stub deliberately blocks normal
@@ -33,29 +33,24 @@ def patched_devices(monkeypatch):
     reads fail loudly; this fixture is the opt-in exception."""
     def _set(devices):
         monkeypatch.setattr(
-            digest.indigo, "devices",
+            data_access.indigo, "devices",
             _FakeDevicesIterable(devices),
             raising=False,
         )
     return _set
 
 
-def _make_runner(
+def _make_context(
     history_db=None,
     whole_house_energy_device_id=None,
     battery_low_threshold=20,
     offline_hours_threshold=24,
 ):
-    """Stubbed DigestRunner for testing the health/energy helpers in
-    isolation. Collaborators we don't touch are MagicMocks."""
-    return digest.DigestRunner(
+    """Stubbed HouseContextAccess for testing the health/energy helpers
+    in isolation. Logger is a MagicMock — nothing else in the class
+    needs stubbing."""
+    return data_access.HouseContextAccess(
         history_db=history_db,
-        rule_store=MagicMock(),
-        observation_store=MagicMock(),
-        delivery=MagicMock(),
-        api_key="",
-        model="claude-sonnet-4-6",
-        email_to="test@example.com",
         logger=MagicMock(),
         whole_house_energy_device_id=whole_house_energy_device_id,
         battery_low_threshold=battery_low_threshold,
@@ -66,8 +61,8 @@ def _make_runner(
 class TestFleetHealth:
     def test_empty_device_list_returns_empty_counts(self, patched_devices):
         patched_devices([])
-        runner = _make_runner()
-        health = runner._fleet_health()
+        ctx = _make_context()
+        health = ctx.fleet_health()
         assert health == {
             "low_batteries": [],
             "low_batteries_total": 0,
@@ -87,8 +82,8 @@ class TestFleetHealth:
             SimpleNamespace(id=4, name="Mains-powered", enabled=True,
                             batteryLevel=None, errorState="", lastSuccessfulComm=now),
         ])
-        runner = _make_runner(battery_low_threshold=20)
-        health = runner._fleet_health()
+        ctx = _make_context(battery_low_threshold=20)
+        health = ctx.fleet_health()
         names = [d["name"] for d in health["low_batteries"]]
         assert "At threshold" in names
         assert "Below" in names
@@ -108,8 +103,8 @@ class TestFleetHealth:
                             batteryLevel=None, errorState="",
                             lastSuccessfulComm=now),
         ])
-        runner = _make_runner()
-        health = runner._fleet_health()
+        ctx = _make_context()
+        health = ctx.fleet_health()
         offline = [d["name"] for d in health["offline_devices"]]
         assert offline == ["Has error"]
         assert health["offline_devices"][0]["error_state"] == "timeout"
@@ -124,8 +119,8 @@ class TestFleetHealth:
                             batteryLevel=None, errorState="",
                             lastSuccessfulComm=now - timedelta(minutes=30)),
         ])
-        runner = _make_runner(offline_hours_threshold=24)
-        health = runner._fleet_health()
+        ctx = _make_context(offline_hours_threshold=24)
+        health = ctx.fleet_health()
         names = [d["name"] for d in health["offline_devices"]]
         assert "Stale" in names
         assert "Recent" not in names
@@ -137,8 +132,8 @@ class TestFleetHealth:
                             batteryLevel=5, errorState="",
                             lastSuccessfulComm=now),
         ])
-        runner = _make_runner()
-        health = runner._fleet_health()
+        ctx = _make_context()
+        health = ctx.fleet_health()
         assert health["low_batteries"] == []
 
     def test_missing_last_comm_and_no_error_is_not_offline(self, patched_devices):
@@ -149,8 +144,8 @@ class TestFleetHealth:
                             batteryLevel=None, errorState="",
                             lastSuccessfulComm=None),
         ])
-        runner = _make_runner()
-        health = runner._fleet_health()
+        ctx = _make_context()
+        health = ctx.fleet_health()
         assert health["offline_devices"] == []
 
     def test_caps_lists_at_30_but_reports_total(self, patched_devices):
@@ -165,8 +160,8 @@ class TestFleetHealth:
                 lastSuccessfulComm=now,
             ))
         patched_devices(devs)
-        runner = _make_runner()
-        health = runner._fleet_health()
+        ctx = _make_context()
+        health = ctx.fleet_health()
         assert len(health["low_batteries"]) == 30
         assert health["low_batteries_total"] == 35
 
@@ -174,15 +169,15 @@ class TestFleetHealth:
 class TestEnergyContext:
     def test_no_history_db_returns_empty(self, patched_devices):
         patched_devices([])
-        runner = _make_runner(history_db=None)
-        assert runner._energy_context() == {}
+        ctx = _make_context(history_db=None)
+        assert ctx.energy_context() == {}
 
     def test_empty_discovery_returns_empty(self, patched_devices):
         patched_devices([])
         history_db = MagicMock()
         history_db.discover_energy_tables.return_value = []
-        runner = _make_runner(history_db=history_db)
-        assert runner._energy_context() == {}
+        ctx = _make_context(history_db=history_db)
+        assert ctx.energy_context() == {}
 
     def test_whole_house_and_top_consumers_assembled(self, patched_devices):
         # Three energy devices: the whole-house meter (high totals
@@ -214,19 +209,19 @@ class TestEnergyContext:
                 "delta_pct": -2.3,
             },
         }
-        runner = _make_runner(
+        ctx = _make_context(
             history_db=history_db,
             whole_house_energy_device_id=452894065,
         )
-        ctx = runner._energy_context()
-        assert ctx["whole_house"]["device_id"] == 452894065
-        assert ctx["whole_house"]["this_week_kwh"] == 127.3
+        result = ctx.energy_context()
+        assert result["whole_house"]["device_id"] == 452894065
+        assert result["whole_house"]["this_week_kwh"] == 127.3
         # Top consumers excludes the whole-house meter, sorted desc by
         # this_week_kwh.
-        names = [c["name"] for c in ctx["top_consumers"]]
+        names = [c["name"] for c in result["top_consumers"]]
         assert "Power Meter" not in names
         assert names == ["Tumble Dryer", "Kettle"]
-        assert ctx["top_consumers"][0]["delta_pct"] == 44.9
+        assert result["top_consumers"][0]["delta_pct"] == 44.9
 
     def test_whole_house_missing_from_rollup_omits_whole_house_block(self, patched_devices):
         # Configured device has no 14-day history (not enough data) →
@@ -244,13 +239,13 @@ class TestEnergyContext:
                 "delta_kwh": 5.7, "delta_pct": 44.9,
             },
         }
-        runner = _make_runner(
+        ctx = _make_context(
             history_db=history_db,
             whole_house_energy_device_id=999,
         )
-        ctx = runner._energy_context()
-        assert "whole_house" not in ctx
-        assert ctx["top_consumers"][0]["name"] == "Tumble Dryer"
+        result = ctx.energy_context()
+        assert "whole_house" not in result
+        assert result["top_consumers"][0]["name"] == "Tumble Dryer"
 
     def test_no_whole_house_device_configured_still_emits_top_consumers(self, patched_devices):
         patched_devices([
@@ -264,13 +259,13 @@ class TestEnergyContext:
                 "delta_kwh": 5.7, "delta_pct": 44.9,
             },
         }
-        runner = _make_runner(
+        ctx = _make_context(
             history_db=history_db,
             whole_house_energy_device_id=None,
         )
-        ctx = runner._energy_context()
-        assert "whole_house" not in ctx
-        assert len(ctx["top_consumers"]) == 1
+        result = ctx.energy_context()
+        assert "whole_house" not in result
+        assert len(result["top_consumers"]) == 1
 
     def test_whole_house_id_not_in_discovery_omits_whole_house(self, patched_devices):
         """If the user configures a whole-house device ID that isn't
@@ -289,13 +284,13 @@ class TestEnergyContext:
                 "delta_kwh": 5.7, "delta_pct": 44.9,
             },
         }
-        runner = _make_runner(
+        ctx = _make_context(
             history_db=history_db,
             whole_house_energy_device_id=999,
         )
-        ctx = runner._energy_context()
-        assert "whole_house" not in ctx
-        assert ctx["top_consumers"][0]["name"] == "Tumble Dryer"
+        result = ctx.energy_context()
+        assert "whole_house" not in result
+        assert result["top_consumers"][0]["name"] == "Tumble Dryer"
         # Verify rollup was called with ONLY the discovered IDs — not
         # with the configured-but-undiscovered 999 appended defensively.
         history_db.energy_rollup_14d.assert_called_once_with([100])
@@ -315,8 +310,8 @@ class TestEnergyContext:
             }
             for i in range(15)
         }
-        runner = _make_runner(history_db=history_db)
-        ctx = runner._energy_context()
-        assert len(ctx["top_consumers"]) == 10
+        ctx = _make_context(history_db=history_db)
+        result = ctx.energy_context()
+        assert len(result["top_consumers"]) == 10
         # Sorted desc — device 0 (15 kWh) should be first.
-        assert ctx["top_consumers"][0]["id"] == 0
+        assert result["top_consumers"][0]["id"] == 0

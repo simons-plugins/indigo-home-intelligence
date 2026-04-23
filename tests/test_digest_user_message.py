@@ -21,7 +21,7 @@ def _runner():
     """DigestRunner with every collaborator stubbed — we only call
     _build_user_message which touches none of them."""
     return DigestRunner(
-        history_db=None,
+        context=None,
         rule_store=None,
         observation_store=None,
         delivery=None,

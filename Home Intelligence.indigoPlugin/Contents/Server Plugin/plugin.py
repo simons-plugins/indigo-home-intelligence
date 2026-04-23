@@ -21,6 +21,7 @@ from datetime import datetime, timezone
 
 import indigo
 
+from data_access import HouseContextAccess
 from history_db import HistoryDB
 from rule_store import RuleStore
 from rule_evaluator import RuleEvaluator
@@ -247,14 +248,8 @@ class Plugin(indigo.PluginBase):
             imap_use_ssl=_as_bool(self.pluginPrefs.get("imapUseSsl"), True),
             logger=self.logger,
         )
-        self.digest = DigestRunner(
+        self.context = HouseContextAccess(
             history_db=self.history_db,
-            rule_store=self.rule_store,
-            observation_store=self.observation_store,
-            delivery=self.delivery,
-            api_key=self.pluginPrefs.get("anthropicApiKey", ""),
-            model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
-            email_to=self.pluginPrefs.get("digestEmailTo", ""),
             logger=self.logger,
             whole_house_energy_device_id=_as_optional_int(
                 self.pluginPrefs.get("wholeHouseEnergyDeviceId")
@@ -267,6 +262,16 @@ class Plugin(indigo.PluginBase):
                 self.pluginPrefs.get("offlineHoursThreshold"),
                 24, min_value=0, max_value=168,
             ),
+        )
+        self.digest = DigestRunner(
+            context=self.context,
+            rule_store=self.rule_store,
+            observation_store=self.observation_store,
+            delivery=self.delivery,
+            api_key=self.pluginPrefs.get("anthropicApiKey", ""),
+            model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
+            email_to=self.pluginPrefs.get("digestEmailTo", ""),
+            logger=self.logger,
         )
 
     # ------------------------------------------------------------------
