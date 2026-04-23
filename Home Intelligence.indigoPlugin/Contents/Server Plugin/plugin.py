@@ -15,8 +15,6 @@ Architectural decisions:
 """
 
 import json
-import secrets
-import traceback
 from datetime import datetime, timezone
 
 import indigo
@@ -230,7 +228,6 @@ class Plugin(indigo.PluginBase):
     def _rebuild_clients(self):
         """Construct DeliveryClient, InboxPoller, and DigestRunner from current
         pluginPrefs. Called from startup() and closedPrefsConfigUi()."""
-        hmac_secret = self._ensure_internal_hmac_secret()
         self.delivery = DeliveryClient(
             smtp_host=self.pluginPrefs.get("smtpHost", ""),
             smtp_port=self.pluginPrefs.get("smtpPort", "465"),
@@ -238,7 +235,6 @@ class Plugin(indigo.PluginBase):
             smtp_password=self.pluginPrefs.get("smtpPassword", ""),
             from_address=self.pluginPrefs.get("smtpFromAddress", ""),
             default_to=self.pluginPrefs.get("digestEmailTo", ""),
-            hmac_secret=hmac_secret,
             smtp_use_ssl=_as_bool(self.pluginPrefs.get("smtpUseSsl"), True),
             logger=self.logger,
         )
@@ -647,40 +643,8 @@ class Plugin(indigo.PluginBase):
         self._refresh_state_variables()
         return {"status": "ok", "reply_id": result}
 
-    def handle_feedback(self, action, dev=None, callerWaitingForResult=None):
-        """IWS HTTP entrypoint — parses the JSON body, verifies the
-        X-HI-Signature HMAC, and delegates to _dispatch_feedback.
-
-        Currently has no in-tree callers: the inbox poller calls
-        _dispatch_feedback directly in-process. Kept for future
-        out-of-process signal sources (iMessage plugin, shortcuts hook,
-        webhook). Deletion criterion: remove if no such caller arrives
-        after a reasonable interval, and simplify to keep only the
-        in-process path."""
-        try:
-            body_props = action.props.get("body_params", indigo.Dict()) or indigo.Dict()
-            raw_body = action.props.get("request_body", b"")
-            if isinstance(raw_body, bytes):
-                raw_body = raw_body.decode("utf-8", errors="replace")
-            payload = json.loads(raw_body) if raw_body else dict(body_props)
-
-            signature = (
-                action.props.get("headers", indigo.Dict()).get("X-HI-Signature")
-                or payload.pop("signature", None)
-            )
-            if not self.delivery.verify_signature(payload, signature):
-                self.logger.warning("Feedback webhook: invalid signature")
-                return {"status": "unauthorized"}
-
-            return self._dispatch_feedback(payload)
-        except Exception as exc:
-            self.logger.exception(f"handle_feedback failed: {exc}")
-            return {"status": "error", "detail": traceback.format_exc(limit=2)}
-
     def _dispatch_feedback(self, payload: dict) -> dict:
-        """Process a decoded feedback payload. Called directly by the inbox
-        poller (same process, no HMAC needed) and via handle_feedback for
-        HTTP callers.
+        """Process a decoded feedback payload from the inbox poller.
 
         Contract: returns a dict with a `status` key. Any status other
         than 'ok' or 'accepted' causes the inbox poller to leave the
@@ -1036,22 +1000,3 @@ class Plugin(indigo.PluginBase):
         )
         self.observation_store.ensure_variable_exists()
 
-    def _ensure_internal_hmac_secret(self) -> str:
-        """Generate and persist the HMAC secret used by handle_feedback to
-        authenticate external HTTP callers on the IWS /feedback endpoint.
-        Not user-configurable. Stored in pluginPrefs so it survives
-        restarts; rotating it requires clearing that pref. The in-process
-        inbox poller bypasses the IWS endpoint entirely, so this secret
-        is dead weight today but kept for future out-of-process channels
-        (iMessage plugin, webhook, shortcut)."""
-        secret = self.pluginPrefs.get("internalHmacSecret", "")
-        if secret:
-            return secret
-        secret = secrets.token_hex(32)
-        self.pluginPrefs["internalHmacSecret"] = secret
-        try:
-            indigo.server.savePluginPrefs()
-        except Exception as exc:
-            self.logger.warning(f"Could not persist internal HMAC secret: {exc}")
-        self.logger.info("Generated internal HMAC secret for /feedback endpoint")
-        return secret
