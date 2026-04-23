@@ -166,6 +166,14 @@ class TestBasicMethods:
         _, body = _post(handler, _rpc("prompts/list"))
         assert body["result"] == {"prompts": []}
 
+    def test_non_object_params_rejected_as_invalid_params(self, handler):
+        # JSON-RPC 2.0: params MUST be Object or Array. We only use
+        # Object-style params; clients sending lists / strings should
+        # see -32602, not an internal error.
+        for bad in ([], "nope", 42):
+            _, body = _post(handler, _rpc("tools/list", params=bad))
+            assert body["error"]["code"] == -32602, f"expected -32602 for {bad!r}"
+
 
 # ---------------------------------------------------------------------
 # tools/list and tools/call
@@ -213,6 +221,16 @@ class TestTools:
 
     def test_tools_call_unknown_tool_errors(self, handler):
         _, body = _post(handler, _rpc("tools/call", params={"name": "nope"}))
+        assert body["error"]["code"] == -32602
+
+    def test_tools_call_rejects_non_object_arguments(self, handler):
+        handler.register_tool(
+            name="echo", description="x", input_schema={},
+            handler=lambda **kw: "",
+        )
+        _, body = _post(handler, _rpc("tools/call", params={
+            "name": "echo", "arguments": [1, 2, 3],
+        }))
         assert body["error"]["code"] == -32602
 
     def test_tools_call_validation_error_returns_is_error(self, handler):

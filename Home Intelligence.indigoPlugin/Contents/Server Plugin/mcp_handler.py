@@ -186,7 +186,14 @@ class MCPHandler:
 
         msg_id = msg.get("id")
         method = msg["method"]
-        params = msg.get("params") or {}
+        # Spec: params MUST be Object or Array (or omitted). We only
+        # use Object-style params, so reject non-object params with
+        # -32602 per JSON-RPC 2.0 rather than trying to .get() a list
+        # and crashing with -32603 internal error.
+        raw_params = msg.get("params")
+        if raw_params is not None and not isinstance(raw_params, dict):
+            return _json_rpc_error(msg_id, -32602, "Invalid params: expected object")
+        params = raw_params or {}
 
         client_ip = (
             headers.get("x-forwarded-for", "").split(",")[0].strip()
@@ -307,7 +314,12 @@ class MCPHandler:
         params: Dict[str, Any],
     ) -> Dict[str, Any]:
         tool_name = params.get("name")
-        tool_args = params.get("arguments") or {}
+        raw_args = params.get("arguments")
+        if raw_args is not None and not isinstance(raw_args, dict):
+            return _json_rpc_error(
+                msg_id, -32602, "Invalid params: arguments must be an object"
+            )
+        tool_args = raw_args or {}
 
         if tool_name not in self._tools:
             return _json_rpc_error(msg_id, -32602, f"Unknown tool: {tool_name}")

@@ -42,7 +42,7 @@ Plugin prefs (via **Plugins → Home Intelligence → Configure…**):
 
 The plugin hosts an MCP (Model Context Protocol) server at
 
-```
+```text
 POST /message/com.simons-plugins.home-intelligence/mcp
 ```
 
