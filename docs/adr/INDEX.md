@@ -18,8 +18,11 @@ Format: MADR 4.0.0 (https://adr.github.io/madr/). Template at
 * [ADR-0005](0005-minimal-mcp-tool-surface.md) - ADR-0005: Keep the MCP tool surface minimal; do not duplicate tools available in mlamoure's MCP
 * [ADR-0006](0006-safety-allowlist-all-rule-write-paths.md) - ADR-0006: Enforce the rule-target safety allowlist on every rule-write path, server-side
 * [ADR-0007](0007-weekly-email-optional.md) - ADR-0007: Make the weekly digest email optional, default off for new installs after v2
+* [ADR-0008](0008-general-indigo-mcp-supersede-by-lite.md) - ADR-0008: Cross-reference: workspace ADR-0003 supersedes the assumed-mlamoure default in HI's ADR-0003
 
 <!-- adrlogstop -->
+
+> **Note on ADR-0003**: the dual-MCP architecture it describes is still valid, but its assumption that mlamoure's plugin serves the `mcp__indigo__*` namespace is **partially superseded** by [ADR-0008](0008-general-indigo-mcp-supersede-by-lite.md) → workspace ADR-0003. On Intel Mac under Indigo 2025.2+, that namespace now routes to `indigo-mcp-lite`.
 
 ## Context: PRDs
 
