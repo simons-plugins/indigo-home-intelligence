@@ -1,0 +1,1 @@
+email_reply_parser>=0.5.12   # inbox.py uses EmailReplyParser to strip quoted text from digest YES-replies; falls back to a marker stripper when missing
