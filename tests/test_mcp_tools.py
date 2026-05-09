@@ -32,10 +32,69 @@ class _FakeRuleStore:
 
 class _FakeObservationStore:
     def __init__(self, observations):
-        self._observations = observations
+        self._observations = list(observations)
+        self.responses = []   # log of record_response calls
 
     def list_all(self):
         return list(self._observations)
+
+    def get(self, observation_id):
+        for obs in self._observations:
+            if obs.get("id") == observation_id:
+                return dict(obs)
+        return None
+
+    def record_response(self, observation_id, response, body="", rule_id=None):
+        self.responses.append(
+            {"id": observation_id, "response": response,
+             "body": body, "rule_id": rule_id}
+        )
+        for obs in self._observations:
+            if obs.get("id") == observation_id:
+                obs["user_response"] = response
+                if rule_id is not None:
+                    obs["rule_id"] = rule_id
+                return True
+        return False
+
+
+class _CapturingRuleStore:
+    """RuleStore fake that records every mutation for assertion."""
+    def __init__(self, rules=None):
+        self._rules = {r["id"]: dict(r) for r in (rules or [])}
+        self._counter = 0
+        self.added = []
+        self.updated = []
+        self.deleted = []
+
+    def list_rules(self):
+        return list(self._rules.values())
+
+    def get_rule(self, rule_id):
+        r = self._rules.get(rule_id)
+        return dict(r) if r else None
+
+    def add_rule(self, rule):
+        self._counter += 1
+        new_id = f"rule-{self._counter}"
+        record = dict(rule)
+        record["id"] = new_id
+        record.setdefault("enabled", True)
+        record.setdefault("fires_count", 0)
+        self._rules[new_id] = record
+        self.added.append(record)
+        return new_id
+
+    def update_rule(self, rule_id, **changes):
+        self.updated.append({"id": rule_id, "changes": changes})
+        if rule_id not in self._rules:
+            return False
+        self._rules[rule_id].update(changes)
+        return True
+
+    def delete_rule(self, rule_id):
+        self.deleted.append(rule_id)
+        return self._rules.pop(rule_id, None) is not None
 
 
 class _FakeHistoryDB:
@@ -397,3 +456,258 @@ class TestRegisterAll:
         body = json.loads(resp["content"])
         assert body["result"]["contents"][0]["text"] == INSTRUCTIONS
         assert body["result"]["contents"][0]["mimeType"] == "text/markdown"
+
+
+# ---------------------------------------------------------------------
+# propose_rule / add_rule / update_rule (write tools)
+# ---------------------------------------------------------------------
+
+
+def _valid_rule(description="nightly off"):
+    """Shared fixture: a schema-valid rule the safety check will
+    accept as long as the test's safety_check fake returns True."""
+    return {
+        "description": description,
+        "when": {"device_id": 100, "state": "onState", "equals": True, "for_minutes": 30},
+        "then": {"device_id": 200, "op": "off"},
+    }
+
+
+@pytest.fixture
+def fake_plugin_module(monkeypatch):
+    """Install a minimal `plugin` module into sys.modules with the
+    symbols mcp_tools' write tools import at runtime. monkeypatch
+    restores sys.modules after the test — avoids cross-test leaks and
+    order-dependence when the real `plugin` module eventually imports
+    something that needs Indigo stubs."""
+    import sys
+    import types
+
+    mod = types.ModuleType("plugin")
+    mod._render_rule_human = lambda rule: f"preview of {rule.get('description')}"
+    monkeypatch.setitem(sys.modules, "plugin", mod)
+    return mod
+
+
+class TestProposeRule:
+    def _register(self, handler, safety_check=lambda _id: True):
+        import mcp_tools
+        mcp_tools._register_propose_rule(handler, safety_check=safety_check)
+
+    def test_valid_rule_returns_preview(self, handler, fake_plugin_module):
+        self._register(handler, safety_check=lambda _id: True)
+        body = _call_tool(handler, "propose_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        assert payload["stage"] == "validated"
+        assert "nightly off" in payload["preview"]
+
+    def test_schema_error_short_circuits_safety(self, handler):
+        # safety_check that would raise if called — asserts we never
+        # reach it on a schema failure.
+        def boom(_id):
+            raise AssertionError("safety_check called despite schema error")
+        self._register(handler, safety_check=boom)
+        bad_rule = {"description": "missing when/then"}
+        body = _call_tool(handler, "propose_rule", {"rule": bad_rule})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is False
+        assert payload["stage"] == "schema"
+
+    def test_unsafe_target_returns_safety_stage(self, handler):
+        self._register(handler, safety_check=lambda _id: False)
+        body = _call_tool(handler, "propose_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is False
+        assert payload["stage"] == "safety"
+        assert payload["target_device_id"] == 200
+        # Rationale surfaces the device classes that trigger rejection
+        # so Claude can narrate it back to the user — assert the
+        # specifics we rely on in the field description.
+        rationale = payload["allowlist_rationale"].lower()
+        assert "thermostat" in rationale
+        assert "dimmer" in rationale or "relay" in rationale
+
+
+class TestAddRule:
+    def _register(self, handler, *, safety_check=lambda _id: True,
+                  rule_store=None, observation_store=None,
+                  send_confirmation=None, send_rejection=None,
+                  after_write=None, logger=None):
+        import mcp_tools
+        mcp_tools._register_add_rule(
+            handler,
+            rule_store=rule_store or _CapturingRuleStore(),
+            observation_store=observation_store or _FakeObservationStore([]),
+            safety_check=safety_check,
+            send_confirmation=send_confirmation,
+            send_rejection=send_rejection,
+            after_write=after_write,
+            logger=logger or logging.getLogger("test-add-rule"),
+        )
+
+    def test_writes_rule_and_sends_confirmation_when_safe(self, handler):
+        rs = _CapturingRuleStore()
+        sent = []
+        self._register(
+            handler,
+            rule_store=rs,
+            send_confirmation=lambda obs, rid, rule: sent.append((obs, rid, rule)),
+        )
+        body = _call_tool(handler, "add_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        assert payload["rule_id"] == "rule-1"
+        assert len(rs.added) == 1
+        assert rs.added[0]["description"] == "nightly off"
+        # Chat-initiated (no from_observation_id) — confirmation email
+        # still fires with a synthetic observation shell.
+        assert len(sent) == 1
+        shell, rule_id, _rule = sent[0]
+        assert rule_id == "rule-1"
+        assert shell["id"].startswith("mcp-")
+
+    def test_schema_error_raises_value_error(self, handler):
+        self._register(handler)
+        body = _call_tool(handler, "add_rule", {"rule": {"description": "no when"}})
+        # ValueError → isError: true tool result.
+        assert body["result"]["isError"] is True
+
+    def test_unsafe_target_refused_and_no_write(self, handler):
+        rs = _CapturingRuleStore()
+        sent_conf = []
+        sent_rej = []
+        self._register(
+            handler,
+            safety_check=lambda _id: False,
+            rule_store=rs,
+            send_confirmation=lambda *a: sent_conf.append(a),
+            send_rejection=lambda *a: sent_rej.append(a),
+        )
+        body = _call_tool(handler, "add_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is False
+        assert payload["stage"] == "safety"
+        assert rs.added == []
+        # No confirmation, and no rejection email either — rejection
+        # emails only fire when we have an observation to link against.
+        assert sent_conf == []
+        assert sent_rej == []
+
+    def test_unsafe_target_with_observation_sends_rejection(self, handler):
+        rs = _CapturingRuleStore()
+        obs_store = _FakeObservationStore([
+            {"id": "obs-1", "headline": "flag X"},
+        ])
+        sent_rej = []
+        self._register(
+            handler,
+            safety_check=lambda _id: False,
+            rule_store=rs,
+            observation_store=obs_store,
+            send_rejection=lambda obs, target: sent_rej.append((obs, target)),
+        )
+        body = _call_tool(handler, "add_rule", {
+            "rule": _valid_rule(),
+            "from_observation_id": "obs-1",
+        })
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is False
+        assert rs.added == []
+        # Observation marked rejected; rejection email sent once.
+        assert any(r["response"] == "rejected_unsafe_target"
+                   for r in obs_store.responses)
+        assert len(sent_rej) == 1
+
+    def test_from_observation_id_updates_observation_on_success(self, handler):
+        rs = _CapturingRuleStore()
+        obs_store = _FakeObservationStore([
+            {"id": "obs-42", "headline": "Something noisy", "user_response": None},
+        ])
+        self._register(
+            handler,
+            rule_store=rs,
+            observation_store=obs_store,
+            send_confirmation=lambda *a: None,
+        )
+        body = _call_tool(handler, "add_rule", {
+            "rule": _valid_rule(),
+            "from_observation_id": "obs-42",
+        })
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        recorded = [r for r in obs_store.responses if r["id"] == "obs-42"]
+        assert len(recorded) == 1
+        assert recorded[0]["response"] == "yes"
+        assert recorded[0]["rule_id"] == "rule-1"
+
+    def test_from_observation_id_not_found_raises(self, handler):
+        self._register(handler)
+        body = _call_tool(handler, "add_rule", {
+            "rule": _valid_rule(),
+            "from_observation_id": "nope",
+        })
+        assert body["result"]["isError"] is True
+
+
+class TestUpdateRule:
+    def _register(self, handler, rules=None, after_write=None):
+        import mcp_tools
+        store = _CapturingRuleStore(rules or [
+            {"id": "r1", "enabled": True, "description": "noon off"},
+            {"id": "r2", "enabled": True, "auto_disabled": True,
+             "auto_disabled_reason": "10 failures",
+             "auto_disabled_at": "2026-04-22T10:00:00", "description": "x"},
+        ])
+        mcp_tools._register_update_rule(
+            handler, rule_store=store,
+            after_write=after_write,
+            logger=logging.getLogger("test-update"),
+        )
+        return store
+
+    def test_disable_marks_rule_disabled(self, handler):
+        store = self._register(handler)
+        body = _call_tool(handler, "update_rule", {"rule_id": "r1", "action": "disable"})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        assert payload["action"] == "disable"
+        assert store.updated[-1] == {"id": "r1", "changes": {"enabled": False}}
+
+    def test_enable_clears_auto_disabled_metadata(self, handler):
+        store = self._register(handler)
+        body = _call_tool(handler, "update_rule", {"rule_id": "r2", "action": "enable"})
+        assert json.loads(body["result"]["content"][0]["text"])["ok"] is True
+        change = store.updated[-1]["changes"]
+        assert change["enabled"] is True
+        assert change["auto_disabled"] is False
+        assert change["auto_disabled_reason"] is None
+        assert change["auto_disabled_at"] is None
+
+    def test_delete_removes_rule(self, handler):
+        store = self._register(handler)
+        body = _call_tool(handler, "update_rule", {"rule_id": "r1", "action": "delete"})
+        assert json.loads(body["result"]["content"][0]["text"])["ok"] is True
+        assert "r1" in store.deleted
+
+    def test_unknown_rule_errors(self, handler):
+        self._register(handler)
+        body = _call_tool(handler, "update_rule", {"rule_id": "ghost", "action": "disable"})
+        assert body["result"]["isError"] is True
+
+    def test_unknown_action_errors(self, handler):
+        self._register(handler)
+        body = _call_tool(handler, "update_rule", {"rule_id": "r1", "action": "frobnicate"})
+        assert body["result"]["isError"] is True
+
+    def test_successful_mutation_fires_after_write_hook(self, handler):
+        import mcp_tools
+        store = _CapturingRuleStore([{"id": "r1", "enabled": True, "description": "x"}])
+        hits = []
+        mcp_tools._register_update_rule(
+            handler, rule_store=store,
+            after_write=lambda: hits.append("refresh"),
+            logger=logging.getLogger("test-after-write"),
+        )
+        _call_tool(handler, "update_rule", {"rule_id": "r1", "action": "disable"})
+        assert hits == ["refresh"]

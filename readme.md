@@ -51,7 +51,7 @@ bridge (until native HTTP MCP transport ships). Transport is
 stateless JSON-RPC 2.0; authentication rides on Indigo's reflector
 (remote) or implicit LAN trust (local).
 
-### Tools (v1, read-only)
+### Read tools
 
 | Tool | What it does |
 |---|---|
@@ -59,6 +59,20 @@ stateless JSON-RPC 2.0; authentication rides on Indigo's reflector
 | `get_observations(status_filter="all", days_back=60)` | Prior digest observations + user responses. Lets Claude avoid re-proposing things you declined. |
 | `query_sql_logger(device_id, column, time_range="24h")` | SQL Logger history for one device + column. Ranges: `1h`, `6h`, `24h`, `7d`, `30d`. |
 | `house_context_snapshot(days=7)` | Curated whole-house bundle — devices, triggers, schedules, action groups, event log + summary, SQL rollups, fleet health, energy context, rules, observations. Expensive; use sparingly. |
+
+### Write tools
+
+All three go through the same server-side safety allowlist
+(`_is_safe_rule_target`) the email-YES flow uses per ADR-0006.
+Thermostats, security systems, locks, cameras, and devices without
+a power-switchable surface are refused — regardless of who's
+asking.
+
+| Tool | What it does |
+|---|---|
+| `propose_rule(rule)` | Validate schema + safety allowlist, no write. Returns a human-readable preview on success. Intended as "show the user what this rule would look like before committing." |
+| `add_rule(rule, from_observation_id?)` | Persist the rule after propose_rule has validated it. Sends the same confirmation email as the Sunday-digest YES flow. If `from_observation_id` is set, updates the observation's `user_response`. |
+| `update_rule(rule_id, action)` | Actions: `disable`, `enable`, `delete`. `enable` also clears auto-disabled metadata so the evaluator's failure counter resets. `delete` is permanent. |
 
 ### Resource
 
@@ -181,6 +195,13 @@ show both `indigo:*` tools and `home-intelligence:*` tools.
   reads `home-intelligence:digest_instructions` resource + calls
   `home-intelligence:house_context_snapshot`. Same reasoning
   substrate as Sunday's email, no API spend.
+- *"Add a rule that turns the tumble dryer plug off if it's been
+  on for 2 hours."* → Claude calls `propose_rule` first to show
+  you the preview, then `add_rule` after you confirm. Safety
+  allowlist blocks anything pointed at thermostats / security /
+  locks regardless of what Claude proposes.
+- *"Disable the noisy hall motion rule until next weekend."* →
+  `update_rule` with `action: "disable"`.
 - *"Turn off the study lamp."* → mlamoure's territory
   (`indigo:device_turn_off`); HI doesn't duplicate device control.
 
