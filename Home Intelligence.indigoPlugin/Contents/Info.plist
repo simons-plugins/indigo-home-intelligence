@@ -4,7 +4,7 @@
 <plist version="1.0">
 <dict>
     <key>PluginVersion</key>
-    <string>2026.1.4</string>
+    <string>2026.1.5</string>
     <key>ServerApiVersion</key>
     <string>3.6</string>
     <key>IwsApiVersion</key>
@@ -24,5 +24,12 @@
             <string>https://github.com/simons-plugins/indigo-home-intelligence</string>
         </dict>
     </array>
+    <key>GithubInfo</key>
+    <dict>
+        <key>GithubRepo</key>
+        <string>indigo-home-intelligence</string>
+        <key>GithubUser</key>
+        <string>simons-plugins</string>
+    </dict>
 </dict>
 </plist>
