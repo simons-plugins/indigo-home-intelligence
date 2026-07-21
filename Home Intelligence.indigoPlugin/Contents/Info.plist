@@ -17,5 +17,19 @@
     <string>1.0.0</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0</string>
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>https://github.com/simons-plugins/indigo-home-intelligence</string>
+        </dict>
+    </array>
+    <key>GithubInfo</key>
+    <dict>
+        <key>GithubRepo</key>
+        <string>indigo-home-intelligence</string>
+        <key>GithubUser</key>
+        <string>simons-plugins</string>
+    </dict>
 </dict>
 </plist>
