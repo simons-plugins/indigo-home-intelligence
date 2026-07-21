@@ -13,13 +13,18 @@ result, which is the MCP 2025-11-25 pattern for "your arguments
 were wrong, self-correct and retry".
 """
 
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 from data_access import HouseContextAccess
 from event_log_reader import EventLogReader
 
 
 DIGEST_INSTRUCTIONS_URI = "home-intelligence:digest_instructions"
+
+# Valid actions for the update_rule tool — matches Manage Rule...
+# menu item's action list. Keeping them in one place means both
+# surfaces agree on the vocabulary.
+_UPDATE_RULE_ACTIONS = ("disable", "enable", "delete")
 
 
 # Allowed values for query_sql_logger's time_range argument. Matches
@@ -55,8 +60,31 @@ def register_all(
     observation_store,
     history_db,
     logger,
+    safety_check: Optional[Callable[[int], bool]] = None,
+    send_confirmation: Optional[Callable[[dict, str, dict], None]] = None,
+    send_rejection: Optional[Callable[[dict, int], None]] = None,
+    after_write: Optional[Callable[[], None]] = None,
 ) -> None:
-    """Register all read tools + resources on the given MCPHandler."""
+    """Register all read + write tools + resources on the given
+    MCPHandler.
+
+    The four optional callables are what the write tools need
+    (propose_rule / add_rule / update_rule):
+
+    - ``safety_check(device_id) -> bool`` — mirrors plugin's
+      ``_is_safe_rule_target``; returns True only for rule targets
+      on the safety allowlist (dimmer / relay / smart plug).
+      If omitted, write tools are NOT registered.
+    - ``send_confirmation(observation, rule_id, rule)`` — the same
+      confirmation-email template used by the email-YES flow.
+    - ``send_rejection(observation, target_device_id)`` — rejection
+      email used when the safety gate refuses a write.
+    - ``after_write()`` — fired after every successful rule mutation
+      (add_rule, update_rule). Plugin wires this to
+      ``_refresh_state_variables`` so the Indigo state vars
+      (``hi_active_rules`` etc.) stay in sync with chat-initiated
+      changes the same way they do with menu-initiated ones.
+    """
     _register_get_rules(handler, rule_store=rule_store)
     _register_get_observations(handler, observation_store=observation_store)
     _register_query_sql_logger(handler, history_db=history_db, logger=logger)
@@ -68,6 +96,23 @@ def register_all(
         logger=logger,
     )
     _register_digest_instructions_resource(handler)
+
+    if safety_check is not None:
+        _register_propose_rule(handler, safety_check=safety_check)
+        _register_add_rule(
+            handler,
+            rule_store=rule_store,
+            observation_store=observation_store,
+            safety_check=safety_check,
+            send_confirmation=send_confirmation,
+            send_rejection=send_rejection,
+            after_write=after_write,
+            logger=logger,
+        )
+        _register_update_rule(
+            handler, rule_store=rule_store,
+            after_write=after_write, logger=logger,
+        )
 
 
 def _register_digest_instructions_resource(handler) -> None:
@@ -411,4 +456,295 @@ def _register_house_context_snapshot(
             "additionalProperties": False,
         },
         handler=house_context_snapshot,
+    )
+
+
+# ---------------------------------------------------------------------
+# propose_rule, add_rule, update_rule (write surface)
+# ---------------------------------------------------------------------
+#
+# All three write tools share the validation path from
+# digest.DigestRunner._validate_rule. Importing inside the register
+# functions (rather than at module top) keeps mcp_tools loadable in
+# tests that don't touch the digest module.
+
+
+# Rule schema fragment — reused across tool input schemas so the
+# write tools present the same shape to Claude that the email flow
+# persists. Keeping this as a dict (not a full JSON Schema $ref) is
+# deliberate: Claude Desktop's tool-schema validation is permissive,
+# and adding a top-level $defs block would be more ceremony than
+# value at four tools.
+_RULE_INPUT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "description": {
+            "type": "string",
+            "description": "Human summary of what the rule does.",
+        },
+        "when": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "integer"},
+                "state": {"type": "string", "description": "e.g. onState, brightness"},
+                "equals": {"description": "Match value — true/false/int/string"},
+                "after_local_time": {"type": "string", "description": "HH:MM"},
+                "before_local_time": {"type": "string", "description": "HH:MM"},
+                "for_minutes": {"type": "integer", "minimum": 1},
+            },
+            "required": ["device_id", "state", "equals"],
+        },
+        "then": {
+            "type": "object",
+            "properties": {
+                "device_id": {"type": "integer"},
+                "op": {
+                    "type": "string",
+                    "enum": ["on", "off", "toggle", "set_brightness"],
+                },
+                "value": {"type": "integer", "minimum": 0, "maximum": 100},
+            },
+            "required": ["device_id", "op"],
+        },
+    },
+    "required": ["description", "when", "then"],
+}
+
+
+def _register_propose_rule(handler, *, safety_check) -> None:
+    def propose_rule(rule: dict) -> dict:
+        from digest import DigestRunner
+
+        err = DigestRunner._validate_rule(rule)
+        if err:
+            return {"ok": False, "stage": "schema", "error": err}
+
+        target_id = (rule.get("then") or {}).get("device_id")
+        if not safety_check(target_id):
+            return {
+                "ok": False,
+                "stage": "safety",
+                "error": "target device is refused by the safety allowlist",
+                "target_device_id": target_id,
+                "allowlist_rationale": (
+                    "Safe rule targets are dimmers, relays, or smart plugs. "
+                    "Thermostats, security systems, locks, cameras, and "
+                    "sensors without a power surface are refused — propose "
+                    "the user create those as standard Indigo triggers "
+                    "themselves, not via the plugin rule engine."
+                ),
+            }
+
+        # Pull in the human renderer only when useful — avoids an
+        # import of plugin.py for callers that only validate.
+        from plugin import _render_rule_human
+
+        return {
+            "ok": True,
+            "stage": "validated",
+            "preview": _render_rule_human(rule),
+        }
+
+    handler.register_tool(
+        name="propose_rule",
+        description=(
+            "Validate a proposed rule against the plugin's fixed schema "
+            "AND the safety allowlist, without writing it. Use this to "
+            "show the user what a rule would look like before committing. "
+            "Returns `ok: true` with a human-readable preview on success, "
+            "or `ok: false` with the specific failure and stage "
+            "(schema / safety). Call `add_rule` afterwards to persist "
+            "if the user agrees."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {"rule": _RULE_INPUT_SCHEMA},
+            "required": ["rule"],
+            "additionalProperties": False,
+        },
+        handler=propose_rule,
+    )
+
+
+def _register_add_rule(
+    handler,
+    *,
+    rule_store,
+    observation_store,
+    safety_check,
+    send_confirmation,
+    send_rejection,
+    after_write,
+    logger,
+) -> None:
+    def add_rule(rule: dict, from_observation_id: Optional[str] = None) -> dict:
+        from digest import DigestRunner
+
+        err = DigestRunner._validate_rule(rule)
+        if err:
+            raise ValueError(err)
+
+        target_id = (rule.get("then") or {}).get("device_id")
+
+        # Observation linkage is optional. If present, look it up now
+        # so both the rejection and confirmation paths can use it.
+        observation = None
+        if from_observation_id:
+            observation = observation_store.get(from_observation_id)
+            if observation is None:
+                raise ValueError(
+                    f"from_observation_id {from_observation_id!r} not found"
+                )
+
+        if not safety_check(target_id):
+            logger.warning(
+                f"add_rule via MCP rejected: target device {target_id} "
+                f"fails safety allowlist"
+            )
+            if observation is not None:
+                observation_store.record_response(
+                    from_observation_id, "rejected_unsafe_target", body=""
+                )
+                if send_rejection is not None:
+                    try:
+                        send_rejection(observation, target_id)
+                    except Exception as exc:
+                        logger.exception(
+                            f"send_rejection email failed: {exc}"
+                        )
+            return {
+                "ok": False,
+                "stage": "safety",
+                "error": "target device is refused by the safety allowlist",
+                "target_device_id": target_id,
+            }
+
+        rule_id = rule_store.add_rule(rule)
+        logger.info(f"MCP add_rule created agent rule {rule_id}")
+
+        if observation is not None:
+            observation_store.record_response(
+                from_observation_id, "yes", body="", rule_id=rule_id
+            )
+
+        # Confirmation email: always attempted (best-effort). Gives
+        # the user an audit trail for chat-initiated rules the same
+        # way email-YES does. Synthesise a minimal observation shell
+        # when we have no linked observation so the same template
+        # works for both paths.
+        if send_confirmation is not None:
+            shell = observation or {
+                "id": f"mcp-{rule_id}",
+                "headline": rule.get("description", "Rule added via MCP"),
+            }
+            try:
+                send_confirmation(shell, rule_id, rule)
+            except Exception as exc:
+                logger.exception(f"send_confirmation email failed: {exc}")
+
+        # Keep the plugin's Indigo state variables in sync with the
+        # rule store — menu path calls the same refresh hook after
+        # mutations. Best-effort; a failure here doesn't invalidate
+        # the rule itself.
+        if after_write is not None:
+            try:
+                after_write()
+            except Exception as exc:
+                logger.exception(f"after_write hook failed: {exc}")
+
+        return {"ok": True, "rule_id": rule_id}
+
+    handler.register_tool(
+        name="add_rule",
+        description=(
+            "Persist a rule to the plugin's rule store. ALWAYS call "
+            "`propose_rule` first and show the preview to the user; only "
+            "call this after they confirm. Enforces the same safety "
+            "allowlist as the email-YES path — thermostats, security "
+            "systems, locks, cameras, and no-power-surface sensors are "
+            "refused server-side. On success sends the same "
+            "confirmation email as the Sunday-digest flow. If "
+            "`from_observation_id` is supplied the observation's "
+            "user_response is set to `yes` with the new rule_id."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "rule": _RULE_INPUT_SCHEMA,
+                "from_observation_id": {
+                    "type": "string",
+                    "description": (
+                        "Optional observation id this rule is "
+                        "accepting — updates the observation's "
+                        "user_response. Leave unset for chat-initiated "
+                        "rules."
+                    ),
+                },
+            },
+            "required": ["rule"],
+            "additionalProperties": False,
+        },
+        handler=add_rule,
+    )
+
+
+def _register_update_rule(handler, *, rule_store, after_write, logger) -> None:
+    def update_rule(rule_id: str, action: str) -> dict:
+        if not isinstance(rule_id, str) or not rule_id.strip():
+            raise ValueError("rule_id must be a non-empty string")
+        if action not in _UPDATE_RULE_ACTIONS:
+            raise ValueError(
+                f"action must be one of {list(_UPDATE_RULE_ACTIONS)}, got {action!r}"
+            )
+
+        existing = rule_store.get_rule(rule_id)
+        if existing is None:
+            raise ValueError(f"rule {rule_id!r} not found")
+
+        if action == "disable":
+            rule_store.update_rule(rule_id, enabled=False)
+        elif action == "enable":
+            # Mirrors Manage Rule... menu: enabling clears
+            # auto_disabled metadata so the evaluator starts fresh.
+            rule_store.update_rule(
+                rule_id,
+                enabled=True,
+                auto_disabled=False,
+                auto_disabled_reason=None,
+                auto_disabled_at=None,
+            )
+        elif action == "delete":
+            rule_store.delete_rule(rule_id)
+
+        logger.info(f"MCP update_rule: {action} on {rule_id}")
+        if after_write is not None:
+            try:
+                after_write()
+            except Exception as exc:
+                logger.exception(f"after_write hook failed: {exc}")
+        return {"ok": True, "rule_id": rule_id, "action": action}
+
+    handler.register_tool(
+        name="update_rule",
+        description=(
+            "Disable, enable, or delete an existing rule. Use this to "
+            "give the user control when they ask to turn off a noisy "
+            "rule mid-week without waiting for the next digest. "
+            "`enable` also clears auto-disabled metadata so the "
+            "evaluator's failure counter resets. `delete` is "
+            "permanent."
+        ),
+        input_schema={
+            "type": "object",
+            "properties": {
+                "rule_id": {"type": "string"},
+                "action": {
+                    "type": "string",
+                    "enum": list(_UPDATE_RULE_ACTIONS),
+                },
+            },
+            "required": ["rule_id", "action"],
+            "additionalProperties": False,
+        },
+        handler=update_rule,
     )

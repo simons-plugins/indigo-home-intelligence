@@ -108,6 +108,27 @@ class TestValidateParsed:
             payload["observation"]["proposed_rule"]["then"]["op"] = op
             assert DigestRunner._validate_parsed(payload) is None, f"op={op} rejected"
 
+    def test_bool_device_id_rejected(self):
+        # isinstance(True, int) is True in Python, so a naive int
+        # check would let {"device_id": true} sneak past the gate and
+        # blow up at indigo.devices[True]. Validator must explicitly
+        # exclude bools.
+        for field, offender in (("when", {"device_id": True, "state": "onState", "equals": True}),
+                                 ("then", {"device_id": False, "op": "off"})):
+            payload = self._valid_with_rule()
+            payload["observation"]["proposed_rule"][field] = offender
+            err = DigestRunner._validate_parsed(payload)
+            assert err is not None and "device_id must be an int" in err, (field, err)
+
+    def test_unhashable_op_rejected_cleanly(self):
+        # A list-typed op would raise `TypeError: unhashable type: 'list'`
+        # against the frozenset membership check; validator must catch
+        # the type before the comparison.
+        payload = self._valid_with_rule()
+        payload["observation"]["proposed_rule"]["then"]["op"] = ["off"]
+        err = DigestRunner._validate_parsed(payload)
+        assert err is not None and "then.op" in err
+
 
 class TestShapeWarnings:
     """The soft shape-check that runs after _validate_parsed. Detects

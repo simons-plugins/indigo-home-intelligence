@@ -518,29 +518,52 @@ class DigestRunner:
         if rule is None:
             return None  # observation with no actionable rule, valid
 
+        return cls._validate_rule(rule, path="proposed_rule")
+
+    @classmethod
+    def _validate_rule(cls, rule: object, path: str = "rule") -> Optional[str]:
+        """Validate a rule dict against the fixed schema.
+
+        Pulled out of ``_validate_parsed`` so the MCP write tools
+        (propose_rule, add_rule) can apply the same schema check as the
+        email-YES flow — keeps validation in one place per ADR-0006.
+        Returns None on success, a short error string on failure.
+
+        ``path`` is the key-path prefix used in error messages. Defaults
+        to ``"rule"`` for standalone use; ``_validate_parsed`` passes
+        ``"proposed_rule"`` to match its existing error strings."""
         if not isinstance(rule, dict):
-            return f"proposed_rule is {type(rule).__name__}, expected object or null"
+            return f"{path} is {type(rule).__name__}, expected object"
         if not isinstance(rule.get("description"), str) or not rule["description"].strip():
-            return "proposed_rule.description missing or empty"
+            return f"{path}.description missing or empty"
 
         when = rule.get("when")
         if not isinstance(when, dict):
-            return "proposed_rule.when missing or not an object"
-        if not isinstance(when.get("device_id"), int):
-            return "proposed_rule.when.device_id must be an int"
+            return f"{path}.when missing or not an object"
+        # Bool is a subclass of int in Python — `isinstance(True, int)` is
+        # True — so we must explicitly reject bools to prevent a JSON
+        # `"device_id": true` sneaking past the gate. `indigo.devices[True]`
+        # would blow up far downstream; catch it here.
+        when_device = when.get("device_id")
+        if not isinstance(when_device, int) or isinstance(when_device, bool):
+            return f"{path}.when.device_id must be an int"
         if not isinstance(when.get("state"), str) or not when["state"]:
-            return "proposed_rule.when.state missing or empty"
+            return f"{path}.when.state missing or empty"
         if "equals" not in when:
-            return "proposed_rule.when.equals is required"
+            return f"{path}.when.equals is required"
 
         then = rule.get("then")
         if not isinstance(then, dict):
-            return "proposed_rule.then missing or not an object"
-        if not isinstance(then.get("device_id"), int):
-            return "proposed_rule.then.device_id must be an int"
+            return f"{path}.then missing or not an object"
+        then_device = then.get("device_id")
+        if not isinstance(then_device, int) or isinstance(then_device, bool):
+            return f"{path}.then.device_id must be an int"
         op = then.get("op")
-        if op not in cls._ALLOWED_RULE_OPS:
-            return f"proposed_rule.then.op must be one of {sorted(cls._ALLOWED_RULE_OPS)}, got {op!r}"
+        # op membership test: a list / dict / any unhashable would raise
+        # TypeError against a frozenset. Type-check first so the caller
+        # gets a clean schema error instead of a 500.
+        if not isinstance(op, str) or op not in cls._ALLOWED_RULE_OPS:
+            return f"{path}.then.op must be one of {sorted(cls._ALLOWED_RULE_OPS)}, got {op!r}"
 
         return None
 
