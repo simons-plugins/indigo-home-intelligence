@@ -56,7 +56,7 @@ GOALS
   already automated by an existing trigger, schedule, or agent rule.
 
 HEALTH & ENERGY SIGNALS
-The ``event_log_summary`` block carries two additional sub-sections
+The ``event_log_summary`` block carries three additional sub-sections
 that summarise the state of the fleet beyond what narrated events
 show:
 
@@ -75,6 +75,18 @@ show:
 - ``energy.top_consumers``: top 10 individual devices by this-week
   consumption, each with the same WoW fields. Excludes the whole-
   house meter (not double-counting).
+- ``zwave_mesh``: Z-Wave mesh health from each node's neighbour
+  table. ``weak_nodes`` lists routing (mains-powered) nodes whose
+  ``neighbour_count`` is at or below ``weak_threshold`` — poorly
+  meshed nodes at risk of slow or failed commands. When a previous
+  week's snapshot exists, ``neighbour_changes`` lists
+  ``{address, name, was, now}`` neighbour-count changes (biggest
+  drops first) and ``new_nodes`` / ``vanished_nodes`` are node
+  addresses added/removed since last week. Battery (non-routing)
+  nodes are excluded from ``weak_nodes`` — sparse tables are normal
+  for them. Neighbour tables refresh only when a node sync or
+  network optimise runs, so an unchanged week may simply mean no
+  sync happened — do not read "no change" as "mesh verified healthy".
 
 How to use them in the narrative:
 - Mention any at-threshold items in the opening weekly-status
@@ -85,14 +97,18 @@ How to use them in the narrative:
 - If a single health signal is the most concerning thing this week
   (e.g. a critical sensor is at 5% battery), flag IT as the
   observation rather than a speculative event-log pattern.
+- Treat a routing node with 1-2 neighbours, or a large week-over-week
+  neighbour drop, as a concrete health item: name the device and
+  suggest a Z-Wave network optimise or physically checking/relocating
+  the node or a nearby repeater.
 
 EVENT LOG FORMAT
 The event log is delivered in two fenced code blocks in the user message:
 
 - ``event_log_summary`` — one compact JSON object with aggregate counts
   (``total_events``, ``top_sources``, ``events_by_hour``,
-  ``sql_logger_rollups``, plus the ``health`` and ``energy`` blocks
-  described above).
+  ``sql_logger_rollups``, plus the ``health``, ``energy``, and
+  ``zwave_mesh`` blocks described above).
 - ``event_log_timeline`` — JSON-lines, chronological, one **positional
   array** per line with the shape
   ``["YYYY-MM-DD HH:MM:SS", source, message]``. Milliseconds are
@@ -249,11 +265,15 @@ class DigestRunner:
         model: str,
         email_to: str,
         logger,
+        mesh_store=None,
     ):
         self.context = context
         self.rule_store = rule_store
         self.observation_store = observation_store
         self.delivery = delivery
+        # Optional: when present, run() diffs the Z-Wave mesh against
+        # last digest's snapshot and persists the new one on success.
+        self.mesh_store = mesh_store
         self.model = model
         self.email_to = email_to
         self.logger = logger
@@ -289,6 +309,13 @@ class DigestRunner:
             event_summary["sql_logger_rollups"] = self.context.sql_rollups()
             event_summary["health"] = self.context.fleet_health()
             event_summary["energy"] = self.context.energy_context()
+            mesh_snapshot = None
+            if self.mesh_store is not None:
+                mesh = self.context.zwave_mesh_health(self.mesh_store.read())
+                # The snapshot is persistence payload, not prompt
+                # material — strip it before the summary reaches Claude.
+                mesh_snapshot = mesh.pop("snapshot", None)
+                event_summary["zwave_mesh"] = mesh
         except Exception as exc:
             self.logger.exception(f"Digest context gathering failed: {exc}")
             return None
@@ -352,7 +379,13 @@ class DigestRunner:
         for shape_warning in self._shape_warnings(parsed):
             self.logger.warning(f"Digest shape: {shape_warning}")
 
-        return self._deliver(parsed, usage, cost_gbp)
+        result = self._deliver(parsed, usage, cost_gbp)
+        # Persist the mesh snapshot only after a successful digest so a
+        # failed week diffs against the last *reported* snapshot rather
+        # than silently swallowing the gap.
+        if result is not None and self.mesh_store is not None and mesh_snapshot:
+            self.mesh_store.write(mesh_snapshot)
+        return result
 
     # ------------------------------------------------------------------
     # Prompt construction

@@ -24,6 +24,7 @@ from history_db import HistoryDB
 from rule_store import RuleStore
 from rule_evaluator import RuleEvaluator
 from observation_store import ObservationStore
+from mesh_store import MeshSnapshotStore
 from digest import DigestRunner
 from delivery import DeliveryClient
 from inbox import InboxPoller, InboxPollError
@@ -183,6 +184,7 @@ class Plugin(indigo.PluginBase):
         self.rule_store = None
         self.rule_evaluator = None
         self.observation_store = None
+        self.mesh_store = None
         self.digest = None
         self.delivery = None
         self.inbox = None
@@ -202,6 +204,7 @@ class Plugin(indigo.PluginBase):
             self._init_history_db()
             self._init_rule_store()
             self._init_observation_store()
+            self._init_mesh_store()
             self.rule_evaluator = RuleEvaluator(self.rule_store, self.logger)
             self._rebuild_clients()
             self._refresh_state_variables()
@@ -262,6 +265,10 @@ class Plugin(indigo.PluginBase):
                 self.pluginPrefs.get("offlineHoursThreshold"),
                 24, min_value=0, max_value=168,
             ),
+            zwave_weak_neighbour_threshold=_as_int(
+                self.pluginPrefs.get("zwaveWeakNeighbourThreshold"),
+                2, min_value=0, max_value=20,
+            ),
         )
         self.digest = DigestRunner(
             context=self.context,
@@ -272,6 +279,7 @@ class Plugin(indigo.PluginBase):
             model=self.pluginPrefs.get("anthropicModel", "claude-sonnet-4-6"),
             email_to=self.pluginPrefs.get("digestEmailTo", ""),
             logger=self.logger,
+            mesh_store=self.mesh_store,
         )
         self.mcp = MCPHandler(
             logger=self.logger,
@@ -1008,4 +1016,13 @@ class Plugin(indigo.PluginBase):
             variable_name=var_name, logger=self.logger
         )
         self.observation_store.ensure_variable_exists()
+
+    def _init_mesh_store(self):
+        var_name = self.pluginPrefs.get(
+            "meshStoreVariable", "home_intelligence_zwave_mesh"
+        )
+        self.mesh_store = MeshSnapshotStore(
+            variable_name=var_name, logger=self.logger
+        )
+        self.mesh_store.ensure_variable_exists()
 

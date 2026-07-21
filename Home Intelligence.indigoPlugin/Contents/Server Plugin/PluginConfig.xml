@@ -225,4 +225,9 @@
         <Label>Offline threshold (hours):</Label>
         <Description>Devices whose lastSuccessfulComm is older than this are flagged as offline in the digest. Devices with a non-empty errorState are always flagged regardless of this threshold.</Description>
     </Field>
+
+    <Field id="zwaveWeakNeighbourThreshold" type="textfield" defaultValue="2">
+        <Label>Z-Wave weak-mesh threshold (neighbours):</Label>
+        <Description>Routing (mains-powered) Z-Wave nodes with this many neighbours or fewer are flagged as weakly meshed in the digest. Battery nodes are never flagged.</Description>
+    </Field>
 </PluginConfig>
