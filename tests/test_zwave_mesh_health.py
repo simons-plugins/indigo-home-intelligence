@@ -59,6 +59,7 @@ def _zw_device(
     features="routing, beaming",
     enabled=True,
     protocol=_ZWAVE,
+    battery_level=None,
 ):
     props = {"zwNodeNeighbors": neighbours, "zwFeatureListStr": features}
     return SimpleNamespace(
@@ -67,6 +68,7 @@ def _zw_device(
         address=address,
         enabled=enabled,
         protocol=protocol,
+        batteryLevel=battery_level,
         globalProps={_ZW_KEY: props},
     )
 
@@ -85,6 +87,21 @@ def test_mesh_flags_weak_routers_only(patched_zwave):
     assert result["weak_nodes_total"] == 1
     assert result["weak_nodes"][0]["name"] == "Weak Relay"
     assert result["weak_nodes"][0]["neighbour_count"] == 1
+
+
+def test_mesh_routing_slave_battery_nodes_not_flagged(patched_zwave):
+    # Real jarvis data: battery sensors report "routing, battery,
+    # beaming, waking" (routing *slave*) and legitimately show 0
+    # neighbours while asleep — they must not be flagged as weak.
+    patched_zwave([
+        _zw_device(1, "Leak Sensor", "31", [],
+                   features="routing, battery, beaming, waking"),
+        _zw_device(2, "No-feature Battery", "32", [],
+                   features="routing", battery_level=77),
+    ])
+    result = _make_context().zwave_mesh_health()
+    assert result["weak_nodes_total"] == 0
+    assert result["nodes_total"] == 2
 
 
 def test_mesh_skips_non_zwave_disabled_and_unsynced(patched_zwave):

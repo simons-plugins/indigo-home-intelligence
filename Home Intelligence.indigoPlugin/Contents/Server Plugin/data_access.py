@@ -237,10 +237,18 @@ class HouseContextAccess:
                     # meaningful to report for this node.
                     continue
                 features = str(zw_props.get("zwFeatureListStr", ""))
+                # Battery nodes report "routing" too (routing *slave*),
+                # so "routing" alone over-flags: a sleeping leak sensor
+                # legitimately shows 0 neighbours. A node only counts as
+                # a router when nothing marks it battery-powered.
+                is_battery = (
+                    "battery" in features
+                    or getattr(dev, "batteryLevel", None) is not None
+                )
                 nodes[address] = {
                     "name": dev.name,
                     "neighbour_count": len(neighbours),
-                    "is_router": "routing" in features,
+                    "is_router": "routing" in features and not is_battery,
                 }
             except (MemoryError, KeyboardInterrupt, SystemExit):
                 raise
