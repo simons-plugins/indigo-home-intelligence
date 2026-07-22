@@ -266,72 +266,6 @@ class TestGetObservations:
 
 
 # ---------------------------------------------------------------------
-# query_sql_logger
-# ---------------------------------------------------------------------
-
-
-class TestQuerySqlLogger:
-    def _register(self, handler, history_db, logger):
-        mcp_tools._register_query_sql_logger(
-            handler, history_db=history_db, logger=logger,
-        )
-
-    def test_happy_path(self, handler, logger):
-        db = _FakeHistoryDB(result={"points": [[1, 2]], "min": 1, "max": 2, "current": 2, "type": "float"})
-        self._register(handler, db, logger)
-        body = _call_tool(handler, "query_sql_logger", {
-            "device_id": 123, "column": "sensorValue", "time_range": "7d",
-        })
-        payload = json.loads(body["result"]["content"][0]["text"])
-        assert payload["current"] == 2
-        assert db.calls == [{"device_id": 123, "column": "sensorValue", "time_range": "7d"}]
-
-    def test_default_time_range_is_24h(self, handler, logger):
-        db = _FakeHistoryDB(result={"points": []})
-        self._register(handler, db, logger)
-        _call_tool(handler, "query_sql_logger", {"device_id": 1, "column": "x"})
-        assert db.calls[0]["time_range"] == "24h"
-
-    def test_bad_device_id_type(self, handler, logger):
-        self._register(handler, _FakeHistoryDB(), logger)
-        body = _call_tool(handler, "query_sql_logger", {
-            "device_id": "not-an-int", "column": "x",
-        })
-        assert body["result"]["isError"] is True
-
-    def test_bad_time_range(self, handler, logger):
-        self._register(handler, _FakeHistoryDB(), logger)
-        body = _call_tool(handler, "query_sql_logger", {
-            "device_id": 1, "column": "x", "time_range": "99d",
-        })
-        assert body["result"]["isError"] is True
-
-    def test_empty_column_rejected(self, handler, logger):
-        self._register(handler, _FakeHistoryDB(), logger)
-        body = _call_tool(handler, "query_sql_logger", {
-            "device_id": 1, "column": "  ",
-        })
-        assert body["result"]["isError"] is True
-
-    def test_null_history_db_rejected(self, handler, logger):
-        self._register(handler, None, logger)
-        body = _call_tool(handler, "query_sql_logger", {
-            "device_id": 1, "column": "x",
-        })
-        assert body["result"]["isError"] is True
-
-    def test_db_exception_downgrades_to_tool_error(self, handler, logger):
-        # DB failures for bad device/column are classified as input
-        # errors so Claude can self-correct to a different device/col.
-        db = _FakeHistoryDB(raises=Exception("table missing"))
-        self._register(handler, db, logger)
-        body = _call_tool(handler, "query_sql_logger", {
-            "device_id": 1, "column": "x",
-        })
-        assert body["result"]["isError"] is True
-
-
-# ---------------------------------------------------------------------
 # house_context_snapshot
 # ---------------------------------------------------------------------
 
@@ -411,7 +345,7 @@ class TestHouseContextSnapshot:
 
 
 class TestRegisterAll:
-    def test_registers_all_four_tools(self, handler, logger):
+    def test_registers_all_three_read_tools(self, handler, logger):
         mcp_tools.register_all(
             handler,
             context=_FakeContext(),
@@ -427,7 +361,6 @@ class TestRegisterAll:
             "get_observations",
             "get_rules",
             "house_context_snapshot",
-            "query_sql_logger",
         ]
 
     def test_registers_digest_instructions_resource(self, handler, logger):

@@ -140,9 +140,11 @@ class HistoryDB:
             "-c", sql,
         ]
 
-        env = None
+        # Server-side read-only enforcement: every statement runs in a
+        # read-only transaction, mirroring SQLite's PRAGMA query_only.
+        env = os.environ.copy()
+        env["PGOPTIONS"] = "-c default_transaction_read_only=on"
         if self.pg_config["password"]:
-            env = os.environ.copy()
             env["PGPASSWORD"] = self.pg_config["password"]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
@@ -237,14 +239,29 @@ class HistoryDB:
         start_time = datetime.now(timezone.utc) - delta
         start_ts = start_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Determine column type first
+        # Strict column allowlist: the requested column MUST match one
+        # of the table's actual columns (case-insensitively); anything
+        # else raises rather than falling through with the caller's
+        # string into a quoted SQL identifier. Keep aligned with
+        # indigo-mcp-lite's history_db.py copy.
         columns_info = self.get_columns(device_id)
-        col_type = "float"
-        for c in columns_info:
-            if c["name"].lower() == column.lower():
-                col_type = c["type"]
-                column = c["name"]  # use exact case from DB
-                break
+        if not columns_info:
+            raise ValueError(
+                f"no SQL Logger history for device {device_id} "
+                f"(table {table_name} missing or unreadable)"
+            )
+        match = next(
+            (c for c in columns_info if c["name"].lower() == column.lower()),
+            None,
+        )
+        if match is None:
+            available = ", ".join(c["name"] for c in columns_info)
+            raise ValueError(
+                f"column {column!r} not found for device {device_id}; "
+                f"available: {available}"
+            )
+        col_type = match["type"]
+        column = match["name"]  # exact case from DB — the only string used in SQL
 
         try:
             if col_type == "bool" or bucket_seconds is None:
