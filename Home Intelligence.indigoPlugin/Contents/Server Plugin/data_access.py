@@ -97,12 +97,14 @@ class HouseContextAccess:
         whole_house_energy_device_id: Optional[int] = None,
         battery_low_threshold: int = 20,
         offline_hours_threshold: int = 24,
+        zwave_weak_neighbour_threshold: int = 2,
     ):
         self.history_db = history_db
         self.logger = logger
         self.whole_house_energy_device_id = whole_house_energy_device_id
         self.battery_low_threshold = battery_low_threshold
         self.offline_hours_threshold = offline_hours_threshold
+        self.zwave_weak_neighbour_threshold = zwave_weak_neighbour_threshold
 
     # ------------------------------------------------------------------
     # Fleet health
@@ -188,6 +190,132 @@ class HouseContextAccess:
             "offline_devices": offline_devices[:30],
             "offline_devices_total": len(offline_devices),
         }
+
+    # ------------------------------------------------------------------
+    # Z-Wave mesh health
+    # ------------------------------------------------------------------
+
+    def zwave_mesh_health(self, previous_snapshot: Optional[dict] = None) -> dict:
+        """Scan Z-Wave devices' neighbour tables for mesh-health signals.
+
+        Pure in-memory over ``indigo.devices``; the neighbour data comes
+        from the Z-Wave interface's per-device ``globalProps``
+        (``zwNodeNeighbors``). One entry per physical node — multi-
+        endpoint devices share an address and the first one seen wins.
+
+        - ``weak_nodes``: routing (mains-powered) nodes whose neighbour
+          count is at or below the configured threshold (default 2).
+          Battery/non-routing nodes are excluded — sparse neighbour
+          tables are normal for them.
+        - ``neighbour_changes`` / ``new_nodes`` / ``vanished_nodes``:
+          only present when ``previous_snapshot`` is supplied; diffs
+          this scan against it, biggest neighbour-count drops first.
+        - ``snapshot``: the ``{address: neighbour_count}`` map for the
+          caller to persist for next week's diff. Callers should strip
+          it before putting the rest in a prompt.
+
+        Caveat: Indigo refreshes neighbour tables only on node sync /
+        network optimise, so an unchanged week may just mean no sync
+        ran — the digest instructions say as much to Claude."""
+        zwave_protocol = indigo.kProtocol.ZWave
+        nodes: dict = {}
+        for dev in indigo.devices:
+            # Per-device isolation, same contract as fleet_health: one
+            # malformed device must not kill the block or the digest.
+            try:
+                if not bool(getattr(dev, "enabled", True)):
+                    continue
+                if getattr(dev, "protocol", None) != zwave_protocol:
+                    continue
+                address = str(getattr(dev, "address", "") or "")
+                if not address or address in nodes:
+                    continue
+                zw_props = self._zwave_interface_props(dev)
+                neighbours = zw_props.get("zwNodeNeighbors")
+                if not isinstance(neighbours, list):
+                    # No neighbour table (node never synced) — nothing
+                    # meaningful to report for this node.
+                    continue
+                features = str(zw_props.get("zwFeatureListStr", ""))
+                # Battery nodes report "routing" too (routing *slave*),
+                # so "routing" alone over-flags: a sleeping leak sensor
+                # legitimately shows 0 neighbours. A node only counts as
+                # a router when nothing marks it battery-powered.
+                is_battery = (
+                    "battery" in features
+                    or getattr(dev, "batteryLevel", None) is not None
+                )
+                nodes[address] = {
+                    "name": dev.name,
+                    "neighbour_count": len(neighbours),
+                    "is_router": "routing" in features and not is_battery,
+                }
+            except (MemoryError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                obj_id = getattr(dev, "id", "?")
+                obj_name = getattr(dev, "name", "?")
+                self.logger.warning(
+                    f"Z-Wave mesh health: skipping device id={obj_id} "
+                    f"name={obj_name!r}: {exc}"
+                )
+                continue
+
+        snapshot = {a: info["neighbour_count"] for a, info in nodes.items()}
+        weak = sorted(
+            (
+                {"address": a, **info}
+                for a, info in nodes.items()
+                if info["is_router"]
+                and info["neighbour_count"] <= self.zwave_weak_neighbour_threshold
+            ),
+            key=lambda x: x["neighbour_count"],
+        )
+        result = {
+            "nodes_total": len(nodes),
+            "weak_threshold": self.zwave_weak_neighbour_threshold,
+            "weak_nodes": weak[:30],
+            "weak_nodes_total": len(weak),
+            "snapshot": snapshot,
+        }
+        if previous_snapshot:
+            prev = {
+                str(k): v
+                for k, v in previous_snapshot.items()
+                if isinstance(v, int) and not isinstance(v, bool)
+            }
+            changes = [
+                {
+                    "address": a,
+                    "name": nodes[a]["name"],
+                    "was": prev[a],
+                    "now": count,
+                }
+                for a, count in snapshot.items()
+                if a in prev and prev[a] != count
+            ]
+            changes.sort(key=lambda c: c["now"] - c["was"])
+            result["neighbour_changes"] = changes[:30]
+            result["neighbour_changes_total"] = len(changes)
+            result["new_nodes"] = sorted(set(snapshot) - set(prev))[:30]
+            result["vanished_nodes"] = sorted(set(prev) - set(snapshot))[:30]
+        return result
+
+    @classmethod
+    def _zwave_interface_props(cls, dev) -> dict:
+        """Return the Z-Wave interface's sub-dict from ``globalProps``.
+
+        Matched by plugin-id substring rather than a hardcoded id so an
+        interface-id rename between Indigo releases degrades to an
+        empty dict, not a wrong-key miss."""
+        global_props = getattr(dev, "globalProps", None)
+        if global_props is None or not hasattr(global_props, "items"):
+            return {}
+        for key, sub in global_props.items():
+            if "zwave" in str(key).lower():
+                coerced = cls._jsonable(sub)
+                return coerced if isinstance(coerced, dict) else {}
+        return {}
 
     # ------------------------------------------------------------------
     # Energy context
