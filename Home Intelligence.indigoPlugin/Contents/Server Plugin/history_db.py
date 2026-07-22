@@ -75,8 +75,7 @@ class HistoryDB:
         sees *what* to fix rather than just the raw psql stderr."""
         try:
             if self.db_type == "sqlite":
-                conn = sqlite3.connect(self.sqlite_path)
-                conn.execute("PRAGMA query_only = ON")
+                conn = self._connect_sqlite()
                 conn.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
                 conn.close()
             else:
@@ -95,11 +94,22 @@ class HistoryDB:
                 self.logger.error(f"SQL Logger connection test failed: {msg}")
             return False
 
+    def _connect_sqlite(self):
+        """Open the SQLite DB strictly read-only via a URI.
+
+        Plain ``sqlite3.connect(path)`` silently CREATES an empty
+        database at a typo'd path — the connection "succeeds" and the
+        misconfiguration only surfaces as missing history later.
+        ``mode=ro`` fails loudly at connect time. Keep aligned with
+        indigo-mcp-lite's copy."""
+        conn = sqlite3.connect(f"file:{self.sqlite_path}?mode=ro", uri=True)
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+
     def _execute_sqlite(self, sql, params=()):
         """Execute a read-only SQLite query and return rows."""
-        conn = sqlite3.connect(self.sqlite_path)
+        conn = self._connect_sqlite()
         try:
-            conn.execute("PRAGMA query_only = ON")
             cursor = conn.execute(sql, params)
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
             rows = cursor.fetchall()
@@ -140,9 +150,11 @@ class HistoryDB:
             "-c", sql,
         ]
 
-        env = None
+        # Server-side read-only enforcement: every statement runs in a
+        # read-only transaction, mirroring SQLite's PRAGMA query_only.
+        env = os.environ.copy()
+        env["PGOPTIONS"] = "-c default_transaction_read_only=on"
         if self.pg_config["password"]:
-            env = os.environ.copy()
             env["PGPASSWORD"] = self.pg_config["password"]
 
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, env=env)
@@ -193,34 +205,33 @@ class HistoryDB:
     def get_columns(self, device_id):
         """Return list of columns and their types for a device history table."""
         table_name = f"device_history_{device_id}"
-        try:
-            if self.db_type == "sqlite":
-                sql = f'SELECT name, type FROM pragma_table_info("{table_name}")'
-                _, rows = self._execute(sql)
-            else:
-                sql = ("SELECT column_name, data_type FROM information_schema.columns "
-                       "WHERE table_name = %s AND table_schema = 'public'")
-                _, rows = self._execute(sql, (table_name,))
+        # Connection/query failures PROPAGATE — swallowing them into []
+        # would make a DB outage indistinguishable from "no history
+        # table". Keep aligned with indigo-mcp-lite's copy.
+        if self.db_type == "sqlite":
+            sql = f'SELECT name, type FROM pragma_table_info("{table_name}")'
+            _, rows = self._execute(sql)
+        else:
+            sql = ("SELECT column_name, data_type FROM information_schema.columns "
+                   "WHERE table_name = %s AND table_schema = 'public'")
+            _, rows = self._execute(sql, (table_name,))
 
-            columns = []
-            for name, col_type in rows:
-                if name in ("id", "ts"):
-                    continue
-                # Normalise type names
-                col_type_lower = col_type.lower()
-                if col_type_lower in ("bool", "boolean"):
-                    mapped = "bool"
-                elif col_type_lower in ("integer", "int", "bigint", "smallint"):
-                    mapped = "int"
-                elif col_type_lower in ("real", "float", "double precision", "numeric"):
-                    mapped = "float"
-                else:
-                    mapped = "text"
-                columns.append({"name": name, "type": mapped})
-            return columns
-        except Exception as e:
-            self.logger.error(f"Error getting columns for device {device_id}: {e}")
-            return []
+        columns = []
+        for name, col_type in rows:
+            if name in ("id", "ts"):
+                continue
+            # Normalise type names
+            col_type_lower = col_type.lower()
+            if col_type_lower in ("bool", "boolean"):
+                mapped = "bool"
+            elif col_type_lower in ("integer", "int", "bigint", "smallint"):
+                mapped = "int"
+            elif col_type_lower in ("real", "float", "double precision", "numeric"):
+                mapped = "float"
+            else:
+                mapped = "text"
+            columns.append({"name": name, "type": mapped})
+        return columns
 
     def query_history(self, device_id, column, time_range="24h", max_points=300):
         """
@@ -237,14 +248,29 @@ class HistoryDB:
         start_time = datetime.now(timezone.utc) - delta
         start_ts = start_time.strftime("%Y-%m-%d %H:%M:%S")
 
-        # Determine column type first
+        # Strict column allowlist: the requested column MUST match one
+        # of the table's actual columns (case-insensitively); anything
+        # else raises rather than falling through with the caller's
+        # string into a quoted SQL identifier. Keep aligned with
+        # indigo-mcp-lite's history_db.py copy.
         columns_info = self.get_columns(device_id)
-        col_type = "float"
-        for c in columns_info:
-            if c["name"].lower() == column.lower():
-                col_type = c["type"]
-                column = c["name"]  # use exact case from DB
-                break
+        if not columns_info:
+            raise ValueError(
+                f"no SQL Logger history for device {device_id} "
+                f"(table {table_name} missing or unreadable)"
+            )
+        match = next(
+            (c for c in columns_info if c["name"].lower() == column.lower()),
+            None,
+        )
+        if match is None:
+            available = ", ".join(c["name"] for c in columns_info)
+            raise ValueError(
+                f"column {column!r} not found for device {device_id}; "
+                f"available: {available}"
+            )
+        col_type = match["type"]
+        column = match["name"]  # exact case from DB — the only string used in SQL
 
         try:
             if col_type == "bool" or bucket_seconds is None:

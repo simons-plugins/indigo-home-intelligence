@@ -27,12 +27,6 @@ DIGEST_INSTRUCTIONS_URI = "home-intelligence:digest_instructions"
 _UPDATE_RULE_ACTIONS = ("disable", "enable", "delete")
 
 
-# Allowed values for query_sql_logger's time_range argument. Matches
-# ``history_db.RANGE_BUCKETS`` keys. Keeping the list here (rather
-# than importing from history_db) makes it a frozen public contract:
-# clients can rely on these values, and adding a new range requires
-# conscious tool-schema review.
-_ALLOWED_TIME_RANGES = ("1h", "6h", "24h", "7d", "30d")
 
 # Observation status filter vocabulary. Matches the user_response
 # values persisted by observation_store, plus "all" and "pending".
@@ -87,7 +81,6 @@ def register_all(
     """
     _register_get_rules(handler, rule_store=rule_store)
     _register_get_observations(handler, observation_store=observation_store)
-    _register_query_sql_logger(handler, history_db=history_db, logger=logger)
     _register_house_context_snapshot(
         handler,
         context=context,
@@ -284,98 +277,6 @@ def _register_get_observations(handler, *, observation_store) -> None:
 
 
 # ---------------------------------------------------------------------
-# query_sql_logger
-# ---------------------------------------------------------------------
-
-
-def _register_query_sql_logger(handler, *, history_db, logger) -> None:
-    def query_sql_logger(
-        device_id: int,
-        column: str,
-        time_range: str = "24h",
-    ) -> dict:
-        if not isinstance(device_id, int):
-            raise ValueError(
-                f"device_id must be an integer Indigo ID, got {type(device_id).__name__}"
-            )
-        if not isinstance(column, str) or not column.strip():
-            raise ValueError("column must be a non-empty string (SQL Logger column name)")
-        if time_range not in _ALLOWED_TIME_RANGES:
-            raise ValueError(
-                f"time_range must be one of {list(_ALLOWED_TIME_RANGES)}, "
-                f"got {time_range!r}"
-            )
-        if history_db is None:
-            raise ValueError(
-                "SQL Logger is not configured. Set up SQL Logger access in the "
-                "Home Intelligence plugin config before calling this tool."
-            )
-        try:
-            return history_db.query_history(
-                device_id=device_id,
-                column=column,
-                time_range=time_range,
-            )
-        except Exception as exc:
-            # query_history raises on DB errors (missing table / column).
-            # Downgrade to ValueError so the MCP handler emits it as a
-            # tool-result error with isError: true rather than a
-            # protocol-level -32603 (which would be "internal error,
-            # back off"). The failure mode here is "bad input" —
-            # device_id not in SQL Logger, or column name doesn't
-            # exist for that device — and a self-correcting agent
-            # should try a different device/column, not give up.
-            logger.info(
-                f"query_sql_logger failed: device_id={device_id} "
-                f"column={column} range={time_range}: {exc}"
-            )
-            raise ValueError(f"SQL Logger query failed: {exc}")
-
-    handler.register_tool(
-        name="query_sql_logger",
-        description=(
-            "Query Indigo SQL Logger history for one device + column "
-            "over a time range. Returns time-bucketed points plus "
-            "min/max/current. Differs from Indigo's built-in history "
-            "(which is the event log); SQL Logger is a richer "
-            "per-device-column time series. Use list_devices / "
-            "search_entities from the general Indigo MCP first to "
-            "discover device IDs and column names."
-        ),
-        input_schema={
-            "type": "object",
-            "properties": {
-                "device_id": {
-                    "type": "integer",
-                    "description": "Indigo device ID (integer). See list_devices.",
-                },
-                "column": {
-                    "type": "string",
-                    "description": (
-                        "SQL Logger column name — e.g. `onOffState`, "
-                        "`brightness`, `sensorValue`, `accumEnergyTotal`. "
-                        "Case-folded internally; exact casing returned "
-                        "from DB metadata."
-                    ),
-                },
-                "time_range": {
-                    "type": "string",
-                    "enum": list(_ALLOWED_TIME_RANGES),
-                    "description": (
-                        "Pre-defined window + bucket size. `1h` is raw, "
-                        "others bucket for readability. Default `24h`."
-                    ),
-                    "default": "24h",
-                },
-            },
-            "required": ["device_id", "column"],
-            "additionalProperties": False,
-        },
-        handler=query_sql_logger,
-    )
-
-
-# ---------------------------------------------------------------------
 # house_context_snapshot
 # ---------------------------------------------------------------------
 
@@ -436,8 +337,9 @@ def _register_house_context_snapshot(
             "devices), energy context (whole-house kWh + top consumers), "
             "existing agent rules, and recent observations. EXPENSIVE "
             "(~20k tokens on a 1000-device house) — use sparingly. Prefer "
-            "calling individual tools (get_rules, get_observations, "
-            "query_sql_logger) when you only need one block."
+            "calling individual tools (get_rules, get_observations, or "
+            "query_sql_logger on the general Indigo MCP) when you only "
+            "need one block."
         ),
         input_schema={
             "type": "object",
