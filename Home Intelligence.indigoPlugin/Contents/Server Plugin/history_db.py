@@ -75,8 +75,7 @@ class HistoryDB:
         sees *what* to fix rather than just the raw psql stderr."""
         try:
             if self.db_type == "sqlite":
-                conn = sqlite3.connect(self.sqlite_path)
-                conn.execute("PRAGMA query_only = ON")
+                conn = self._connect_sqlite()
                 conn.execute("SELECT name FROM sqlite_master WHERE type='table' LIMIT 1")
                 conn.close()
             else:
@@ -95,11 +94,22 @@ class HistoryDB:
                 self.logger.error(f"SQL Logger connection test failed: {msg}")
             return False
 
+    def _connect_sqlite(self):
+        """Open the SQLite DB strictly read-only via a URI.
+
+        Plain ``sqlite3.connect(path)`` silently CREATES an empty
+        database at a typo'd path — the connection "succeeds" and the
+        misconfiguration only surfaces as missing history later.
+        ``mode=ro`` fails loudly at connect time. Keep aligned with
+        indigo-mcp-lite's copy."""
+        conn = sqlite3.connect(f"file:{self.sqlite_path}?mode=ro", uri=True)
+        conn.execute("PRAGMA query_only = ON")
+        return conn
+
     def _execute_sqlite(self, sql, params=()):
         """Execute a read-only SQLite query and return rows."""
-        conn = sqlite3.connect(self.sqlite_path)
+        conn = self._connect_sqlite()
         try:
-            conn.execute("PRAGMA query_only = ON")
             cursor = conn.execute(sql, params)
             columns = [desc[0] for desc in cursor.description] if cursor.description else []
             rows = cursor.fetchall()
@@ -195,34 +205,33 @@ class HistoryDB:
     def get_columns(self, device_id):
         """Return list of columns and their types for a device history table."""
         table_name = f"device_history_{device_id}"
-        try:
-            if self.db_type == "sqlite":
-                sql = f'SELECT name, type FROM pragma_table_info("{table_name}")'
-                _, rows = self._execute(sql)
-            else:
-                sql = ("SELECT column_name, data_type FROM information_schema.columns "
-                       "WHERE table_name = %s AND table_schema = 'public'")
-                _, rows = self._execute(sql, (table_name,))
+        # Connection/query failures PROPAGATE — swallowing them into []
+        # would make a DB outage indistinguishable from "no history
+        # table". Keep aligned with indigo-mcp-lite's copy.
+        if self.db_type == "sqlite":
+            sql = f'SELECT name, type FROM pragma_table_info("{table_name}")'
+            _, rows = self._execute(sql)
+        else:
+            sql = ("SELECT column_name, data_type FROM information_schema.columns "
+                   "WHERE table_name = %s AND table_schema = 'public'")
+            _, rows = self._execute(sql, (table_name,))
 
-            columns = []
-            for name, col_type in rows:
-                if name in ("id", "ts"):
-                    continue
-                # Normalise type names
-                col_type_lower = col_type.lower()
-                if col_type_lower in ("bool", "boolean"):
-                    mapped = "bool"
-                elif col_type_lower in ("integer", "int", "bigint", "smallint"):
-                    mapped = "int"
-                elif col_type_lower in ("real", "float", "double precision", "numeric"):
-                    mapped = "float"
-                else:
-                    mapped = "text"
-                columns.append({"name": name, "type": mapped})
-            return columns
-        except Exception as e:
-            self.logger.error(f"Error getting columns for device {device_id}: {e}")
-            return []
+        columns = []
+        for name, col_type in rows:
+            if name in ("id", "ts"):
+                continue
+            # Normalise type names
+            col_type_lower = col_type.lower()
+            if col_type_lower in ("bool", "boolean"):
+                mapped = "bool"
+            elif col_type_lower in ("integer", "int", "bigint", "smallint"):
+                mapped = "int"
+            elif col_type_lower in ("real", "float", "double precision", "numeric"):
+                mapped = "float"
+            else:
+                mapped = "text"
+            columns.append({"name": name, "type": mapped})
+        return columns
 
     def query_history(self, device_id, column, time_range="24h", max_points=300):
         """

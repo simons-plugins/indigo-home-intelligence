@@ -337,8 +337,9 @@ def _register_house_context_snapshot(
             "devices), energy context (whole-house kWh + top consumers), "
             "existing agent rules, and recent observations. EXPENSIVE "
             "(~20k tokens on a 1000-device house) — use sparingly. Prefer "
-            "calling individual tools (get_rules, get_observations, "
-            "query_sql_logger) when you only need one block."
+            "calling individual tools (get_rules, get_observations, or "
+            "query_sql_logger on the general Indigo MCP) when you only "
+            "need one block."
         ),
         input_schema={
             "type": "object",
