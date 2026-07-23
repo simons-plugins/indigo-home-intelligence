@@ -458,7 +458,11 @@ class HouseContextAccess:
         action labels + resolved device/variable/action-group names
         kept, condition trees summarised. Capped at
         ``_AUTOMATION_CONTENTS_CAP`` entries; ``matched_total`` carries
-        the pre-cap count.
+        the pre-cap count, with ``truncated`` (matches dropped by the
+        cap) and ``compact_errors`` (records skipped by compaction
+        failures) present when nonzero so the two loss modes are
+        separately visible rather than hiding in
+        ``matched_total - len(automations)``.
 
         Unlike ``energy_context`` this RAISES on reader failure (DB
         path unavailable, mid-write parse error — a friendly
@@ -488,6 +492,7 @@ class HouseContextAccess:
                     matched.append((kind, record))
 
         automations: List[dict] = []
+        compact_errors = 0
         for kind, record in matched[: self._AUTOMATION_CONTENTS_CAP]:
             try:
                 automations.append(
@@ -496,6 +501,7 @@ class HouseContextAccess:
             except (MemoryError, KeyboardInterrupt, SystemExit):
                 raise
             except Exception as exc:
+                compact_errors += 1
                 self.logger.warning(
                     f"Automation contents: skipping {kind} "
                     f"id={record.get('id')} name={record.get('name')!r}: {exc}"
@@ -503,6 +509,13 @@ class HouseContextAccess:
                 continue
 
         result = {"automations": automations, "matched_total": len(matched)}
+        cap_truncated = len(matched) - min(
+            len(matched), self._AUTOMATION_CONTENTS_CAP
+        )
+        if cap_truncated:
+            result["truncated"] = cap_truncated
+        if compact_errors:
+            result["compact_errors"] = compact_errors
         skipped = data.get("skipped_automations", 0)
         if skipped:
             result["skipped_automations"] = skipped

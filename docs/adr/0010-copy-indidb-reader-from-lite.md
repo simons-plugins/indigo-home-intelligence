@@ -78,8 +78,9 @@ module.
 ### Confirmation
 
 `tests/test_indidb_reader.py` is an adapted copy of lite's suite and
-must stay green; drift between the copies shows up as a failing
-verbatim-alignment diff during review. Digest wiring and rule-gate
+must stay green. Alignment between the two copies is a MANUAL review
+step — `diff` the modules (HI adds only the header provenance note);
+no automated cross-repo check exists. Digest wiring and rule-gate
 behaviour are covered by `tests/test_automation_contents.py` and the
 `existing_automations` cases in `tests/test_mcp_tools.py`.
 

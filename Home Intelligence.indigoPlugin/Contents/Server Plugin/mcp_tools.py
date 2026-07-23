@@ -416,13 +416,25 @@ _RULE_INPUT_SCHEMA = {
 }
 
 
+# Sentinel payload value for "the acting-on check could not run".
+# Tool descriptions define key-absence as "check ran, no conflicts",
+# so a FAILED check must surface distinctly — never as an all-clear.
+_LOOKUP_UNAVAILABLE = "unavailable"
+
+
 def _existing_automations(context, device_id, logger=None):
     """Best-effort reverse-index lookup: native automations whose
     action steps target ``device_id`` (via the copied .indiDb reader,
     ADR-0010). NON-blocking and purely informational — the ADR-0006
-    safety allowlist is unchanged. Any failure (context without the
-    capability, DB mid-write, reader unavailable) degrades to None so
-    the rule-write path never depends on the database parse."""
+    safety allowlist is unchanged.
+
+    Returns a non-empty list of references, ``None`` when there is
+    nothing to report (no conflicts found, or the context has no
+    reverse-index capability), or ``_LOOKUP_UNAVAILABLE`` when the
+    lookup FAILED (DB mid-write, reader error) — callers put that
+    string in the payload so a failed check never reads as a
+    confident all-clear. The rule-write path itself never depends on
+    the database parse."""
     lookup = getattr(context, "automations_acting_on", None)
     if lookup is None:
         return None
@@ -434,7 +446,7 @@ def _existing_automations(context, device_id, logger=None):
                 f"Existing-automation lookup failed for device "
                 f"{device_id}: {exc}"
             )
-        return None
+        return _LOOKUP_UNAVAILABLE
     return existing or None
 
 
@@ -492,8 +504,11 @@ def _register_propose_rule(
             "already act on the rule's target device, the response "
             "includes an informational `existing_automations` list "
             "(`{automation_type, id, name, roles}`) — surface it to the "
-            "user as a potential conflict before persisting. Call "
-            "`add_rule` afterwards to persist if the user agrees."
+            "user as a potential conflict before persisting. Key absent "
+            "= the check ran and found none; the string \"unavailable\" "
+            "= the check could not run (database unreadable) — do NOT "
+            "treat that as an all-clear. Call `add_rule` afterwards to "
+            "persist if the user agrees."
         ),
         input_schema={
             "type": "object",
@@ -617,7 +632,10 @@ def _register_add_rule(
             "user_response is set to `yes` with the new rule_id. The "
             "success payload includes `existing_automations` (native "
             "Indigo automations already acting on the target device) "
-            "when any exist — informational, relay it to the user."
+            "when any exist — informational, relay it to the user. Key "
+            "absent = checked, none found; the string \"unavailable\" = "
+            "the check could not run — say so rather than implying no "
+            "conflicts."
         ),
         input_schema={
             "type": "object",

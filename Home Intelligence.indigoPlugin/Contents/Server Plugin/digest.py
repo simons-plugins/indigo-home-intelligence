@@ -114,8 +114,10 @@ contents, read from the Indigo database file (not guessed from
 names):
 
 - ``automations``: up to 40 entries, each
-  ``{automation_type, id, name, steps, conditions?, watch?}``.
-  ``automation_type`` is schedule / trigger / action_group. ``steps``
+  ``{automation_type, id, name, steps, conditions?, watch?, enabled?}``.
+  ``automation_type`` is schedule / trigger / action_group. ``enabled``
+  appears only when false — surprising for something that fired (it
+  was likely disabled mid-week); worth a mention. ``steps``
   are the decoded action steps in order — ``do`` names the action
   (turn_on, turn_off, set_heat_setpoint, execute_action_group,
   embedded_script, plugin_action, ...) and referenced entities carry
@@ -125,7 +127,10 @@ names):
   (``logic`` all/any + leaves). ``watch`` (triggers only) is what the
   trigger fires on.
 - ``matched_total``: fired automations matched before the 40-entry
-  cap.
+  cap. ``truncated`` (present when nonzero) is how many matches the
+  cap dropped; ``compact_errors`` (present when nonzero) is how many
+  matched records could not be decoded. Either being nonzero means
+  the ``automations`` list is incomplete.
 - ``skipped_automations``: present when the database parse skipped
   records — treat the block as partial.
 
@@ -463,14 +468,29 @@ class DigestRunner:
         """Attach decoded contents for automations that fired this
         week. Best-effort: any failure (database mid-write, path
         unavailable) degrades to an ABSENT block with a warning — the
-        digest must never be blocked by the .indiDb parse."""
+        digest must never be blocked by the .indiDb parse.
+
+        The block is attached whenever anything MATCHED, even if every
+        record then failed compaction (``automations`` empty) — "40
+        matched, 0 decoded" is a signal Claude should see, not an
+        invisible drop. Only a zero-match result omits the block, and
+        that omission is logged with the unmatched fired names so a
+        name-extraction/DB mismatch is diagnosable."""
         try:
             fired = self._fired_automation_names(events)
             if not fired:
                 return
             contents = self.context.automation_contents_context(fired)
-            if contents.get("automations"):
+            if contents.get("matched_total"):
                 event_summary["automation_contents"] = contents
+            else:
+                shown = sorted(fired)[:20]
+                more = len(fired) - len(shown)
+                suffix = f" (+{more} more)" if more else ""
+                self.logger.warning(
+                    "Automation contents: no fired automation names "
+                    f"matched the database; unmatched: {shown}{suffix}"
+                )
         except (MemoryError, KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:

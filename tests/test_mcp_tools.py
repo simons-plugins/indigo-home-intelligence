@@ -506,16 +506,17 @@ class TestProposeRule:
         assert payload["ok"] is True
         assert "existing_automations" not in payload
 
-    def test_reader_failure_degrades_to_omission_not_error(
+    def test_reader_failure_marks_unavailable_not_all_clear(
             self, handler, fake_plugin_module):
         # NON-blocking contract: a mid-write .indiDb parse must never
-        # fail the preview — the key is just omitted.
+        # fail the preview — but absence means "checked, none found",
+        # so a FAILED check must surface as "unavailable" instead.
         ctx = _ReverseIndexContext(raises=ValueError("mid-write; retry"))
         self._register(handler, context=ctx)
         body = _call_tool(handler, "propose_rule", {"rule": _valid_rule()})
         payload = json.loads(body["result"]["content"][0]["text"])
         assert payload["ok"] is True
-        assert "existing_automations" not in payload
+        assert payload["existing_automations"] == "unavailable"
 
     def test_no_context_keeps_legacy_shape(self, handler, fake_plugin_module):
         # register_all callers that pass no context (or a context
@@ -669,14 +670,17 @@ class TestAddRule:
         assert payload["ok"] is True
         assert "existing_automations" not in payload
 
-    def test_reader_failure_still_writes_rule(self, handler):
+    def test_reader_failure_still_writes_rule_and_marks_unavailable(
+            self, handler):
         rs = _CapturingRuleStore()
         ctx = _ReverseIndexContext(raises=ValueError("db unavailable"))
         self._register(handler, rule_store=rs, context=ctx)
         body = _call_tool(handler, "add_rule", {"rule": _valid_rule()})
         payload = json.loads(body["result"]["content"][0]["text"])
         assert payload["ok"] is True
-        assert "existing_automations" not in payload
+        # Failed check is flagged, never silently an all-clear — and
+        # it never blocks the write.
+        assert payload["existing_automations"] == "unavailable"
         assert len(rs.added) == 1
 
 

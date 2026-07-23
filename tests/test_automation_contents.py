@@ -138,6 +138,26 @@ class TestAutomationContentsScoping:
         result = ctx.automation_contents_context(fired)
         assert result["matched_total"] == 45
         assert len(result["automations"]) == 40
+        # Cap loss is its own counter — distinct from compact_errors.
+        assert result["truncated"] == 5
+        assert "compact_errors" not in result
+
+    def test_exact_name_match_only_no_substring_or_prefix(self, ctx):
+        # Contract pin: fired-name matching is message == record name
+        # (after strip) — a prefix or substring of a real automation
+        # name must NOT match.
+        assert ctx.automation_contents_context(
+            {"Zone 2.5"}                       # prefix
+        )["matched_total"] == 0
+        assert ctx.automation_contents_context(
+            {"one 2.5 Heating"}                # substring
+        )["matched_total"] == 0
+        assert ctx.automation_contents_context(
+            {"zone 2.5 heating"}               # case differs
+        )["matched_total"] == 0
+        assert ctx.automation_contents_context(
+            {"  Zone 2.5 Heating  "}           # stripped, then exact
+        )["matched_total"] == 1
 
 
 # ---------------------------------------------------------------------
@@ -304,6 +324,9 @@ class TestAutomationContentsIsolation:
         result = ctx.automation_contents_context({"Broken", "Fine"})
         assert [a["name"] for a in result["automations"]] == ["Fine"]
         assert result["matched_total"] == 2
+        # Compaction loss is its own counter — distinct from the cap.
+        assert result["compact_errors"] == 1
+        assert "truncated" not in result
         assert logger.warning.called
         assert "Broken" in str(logger.warning.call_args_list)
 
@@ -420,7 +443,7 @@ class TestAttachAutomationContents:
         assert "automation_contents" not in summary
         context.automation_contents_context.assert_not_called()
 
-    def test_empty_match_leaves_block_absent(self):
+    def test_zero_match_leaves_block_absent_and_names_unmatched(self):
         context = MagicMock()
         context.automation_contents_context.return_value = {
             "automations": [], "matched_total": 0,
@@ -431,6 +454,27 @@ class TestAttachAutomationContents:
             summary, [{"source": "Trigger", "message": "Ghost"}]
         )
         assert "automation_contents" not in summary
+        # The omission must be diagnosable: warning names the fired
+        # automations that matched nothing in the database.
+        assert runner.logger.warning.called
+        assert "Ghost" in str(runner.logger.warning.call_args)
+
+    def test_matched_but_undecoded_block_still_attached(self):
+        # "40 matched, 0 decoded" must be visible to Claude, not an
+        # invisible drop: matched_total > 0 attaches even with an
+        # empty automations list.
+        context = MagicMock()
+        context.automation_contents_context.return_value = {
+            "automations": [], "matched_total": 3, "compact_errors": 3,
+        }
+        runner = _bare_runner(context)
+        summary = {}
+        runner._attach_automation_contents(
+            summary, [{"source": "Trigger", "message": "Door opened"}]
+        )
+        assert summary["automation_contents"]["matched_total"] == 3
+        assert summary["automation_contents"]["automations"] == []
+        runner.logger.warning.assert_not_called()
 
     def test_reader_failure_degrades_to_absent_block_with_warning(self):
         context = MagicMock()
@@ -445,3 +489,65 @@ class TestAttachAutomationContents:
         assert "automation_contents" not in summary
         assert summary["health"] == {}  # rest of the summary untouched
         assert runner.logger.warning.called
+
+
+class TestRunPathAssembly:
+    """End-to-end over the run() assembly seam: real HouseContextAccess
+    + real .indiDb fixture feeding _attach_automation_contents, then
+    _build_user_message — asserting the block lands INSIDE the emitted
+    ``event_log_summary`` fenced JSON exactly as Claude will see it.
+    (run() itself needs a live Anthropic client + SMTP; the two
+    methods chained here are the complete summary-to-prompt path.)"""
+
+    @staticmethod
+    def _parse_fenced_block(message: str, fence_tag: str) -> str:
+        start_marker = f"```{fence_tag}\n"
+        start = message.index(start_marker) + len(start_marker)
+        end = message.index("\n```", start)
+        return message[start:end]
+
+    def test_block_lands_in_emitted_event_log_summary_json(self, ctx):
+        import json
+        from datetime import datetime, timedelta, timezone
+
+        runner = DigestRunner(
+            context=ctx,
+            rule_store=None,
+            observation_store=None,
+            delivery=None,
+            api_key="",
+            model="claude-sonnet-4-6",
+            email_to="nobody@example.com",
+            logger=MagicMock(),
+        )
+        events = [
+            {"timestamp": "2026-07-20 09:00:00.000",
+             "source": "Trigger", "message": "Door opened"},
+            {"timestamp": "2026-07-20 21:00:00.000",
+             "source": "Schedule", "message": "Zone 2.5 Heating"},
+            {"timestamp": "2026-07-20 21:00:01.000",
+             "source": "Z-Wave", "message": 'sent "Kitchen Light" on'},
+        ]
+        # Same assembly order as run(): summarise, enrich, attach,
+        # then build the user message.
+        summary = runner.event_log.summarise(events)
+        summary["sql_logger_rollups"] = {}
+        runner._attach_automation_contents(summary, events)
+
+        now = datetime(2026, 7, 21, 8, 0, tzinfo=timezone.utc)
+        message = runner._build_user_message(
+            now, now - timedelta(days=7), 7, events, summary
+        )
+        body = json.loads(
+            self._parse_fenced_block(message, "event_log_summary")
+        )
+        block = body["automation_contents"]
+        assert block["matched_total"] == 2
+        assert {a["name"] for a in block["automations"]} == {
+            "Door opened", "Zone 2.5 Heating",
+        }
+        # Decoded content (not just names) made it into the prompt.
+        sched = next(a for a in block["automations"]
+                     if a["name"] == "Zone 2.5 Heating")
+        assert sched["steps"][0]["do"] == "turn_on"
+        assert sched["steps"][0]["device_name"] == "Kitchen Light"
