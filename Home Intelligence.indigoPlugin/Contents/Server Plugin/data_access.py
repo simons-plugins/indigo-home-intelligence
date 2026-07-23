@@ -7,16 +7,18 @@ trigger/schedule/action-group snapshotting, fleet-health scanning,
 and SQL-Logger rollups all have a single implementation.
 
 Note on side effects: everything in this module reads indigo state
-(`indigo.devices`, `.triggers`, `.schedules`, `.actionGroups`) and the
-configured `history_db`; nothing here writes. Rule writes,
-observation persistence, and email delivery stay in their own
-modules.
+(`indigo.devices`, `.triggers`, `.schedules`, `.actionGroups`), the
+configured `history_db`, and (via `indidb_reader`) the Indigo
+database file; nothing here writes. Rule writes, observation
+persistence, and email delivery stay in their own modules.
 """
 
 from datetime import datetime
 from typing import List, Optional
 
 import indigo
+
+from indidb_reader import IndiDbReader
 
 
 # Plugins whose "devices" are mirrors/virtual/UI-only — exclude
@@ -90,6 +92,17 @@ class HouseContextAccess:
     # device map stays internal; only the top slice hits Claude.
     _TOP_ENERGY_N = 10
 
+    # Hard cap on decoded automations in the digest's automation-
+    # contents block. Scoping to fired-this-week already trims hard;
+    # the cap bounds prompt tokens on weeks where hundreds of
+    # automations fire.
+    _AUTOMATION_CONTENTS_CAP = 40
+
+    # Embedded-script sources are already truncated to 2000 chars by
+    # the reader; for the digest block a short excerpt is enough to
+    # identify what the script touches.
+    _SCRIPT_EXCERPT_AT = 200
+
     def __init__(
         self,
         history_db,
@@ -105,6 +118,10 @@ class HouseContextAccess:
         self.battery_low_threshold = battery_low_threshold
         self.offline_hours_threshold = offline_hours_threshold
         self.zwave_weak_neighbour_threshold = zwave_weak_neighbour_threshold
+        # Lazily-constructed .indiDb reader (ADR-0010). Construction is
+        # cheap and does no I/O, but deferring it keeps this class fully
+        # constructible in tests that never touch automation contents.
+        self._indidb_reader: Optional[IndiDbReader] = None
 
     # ------------------------------------------------------------------
     # Fleet health
@@ -417,6 +434,314 @@ class HouseContextAccess:
             self.logger.warning(f"SQL Logger rollup failed: {exc}")
             return {}
         return {str(did): body for did, body in rollups.items()}
+
+    # ------------------------------------------------------------------
+    # Automation contents (.indiDb reader — ADR-0010)
+    # ------------------------------------------------------------------
+
+    def _indidb(self) -> IndiDbReader:
+        if self._indidb_reader is None:
+            self._indidb_reader = IndiDbReader(
+                indigo_module=indigo, logger=self.logger
+            )
+        return self._indidb_reader
+
+    def automation_contents_context(self, fired_names_or_ids) -> dict:
+        """Compact decoded contents for automations that fired.
+
+        ``fired_names_or_ids`` is an iterable of automation names (str)
+        and/or ids (int) — the digest passes the names it extracted
+        from Trigger / Schedule / Action Group event-log lines, which
+        scopes the block to the digest window (issue #27's token
+        scoping). Matching automations (across schedules, triggers,
+        and action groups) are compacted: raw class/code noise dropped,
+        action labels + resolved device/variable/action-group names
+        kept, condition trees summarised. Capped at
+        ``_AUTOMATION_CONTENTS_CAP`` entries; ``matched_total`` carries
+        the pre-cap count, with ``truncated`` (matches dropped by the
+        cap) and ``compact_errors`` (records skipped by compaction
+        failures) present when nonzero so the two loss modes are
+        separately visible rather than hiding in
+        ``matched_total - len(automations)``.
+
+        Unlike ``energy_context`` this RAISES on reader failure (DB
+        path unavailable, mid-write parse error — a friendly
+        ``ValueError``): callers choose their own degradation (the
+        digest logs a warning and omits the block). Per-automation
+        compaction failures are isolated like ``fleet_health`` — one
+        malformed record degrades to a warning, not a lost block."""
+        fired_names: set = set()
+        fired_ids: set = set()
+        for item in fired_names_or_ids or ():
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, int):
+                fired_ids.add(item)
+            elif isinstance(item, str) and item.strip():
+                fired_names.add(item.strip())
+        if not fired_names and not fired_ids:
+            return {"automations": [], "matched_total": 0}
+
+        reader = self._indidb()
+        data = reader.automations()
+
+        matched: List[tuple] = []
+        for kind in ("schedule", "trigger", "action_group"):
+            for record in data[kind].values():
+                if record["id"] in fired_ids or record["name"] in fired_names:
+                    matched.append((kind, record))
+
+        automations: List[dict] = []
+        compact_errors = 0
+        for kind, record in matched[: self._AUTOMATION_CONTENTS_CAP]:
+            try:
+                automations.append(
+                    self._compact_automation(kind, record, reader)
+                )
+            except (MemoryError, KeyboardInterrupt, SystemExit):
+                raise
+            except Exception as exc:
+                compact_errors += 1
+                self.logger.warning(
+                    f"Automation contents: skipping {kind} "
+                    f"id={record.get('id')} name={record.get('name')!r}: {exc}"
+                )
+                continue
+
+        result = {"automations": automations, "matched_total": len(matched)}
+        cap_truncated = len(matched) - min(
+            len(matched), self._AUTOMATION_CONTENTS_CAP
+        )
+        if cap_truncated:
+            result["truncated"] = cap_truncated
+        if compact_errors:
+            result["compact_errors"] = compact_errors
+        skipped = data.get("skipped_automations", 0)
+        if skipped:
+            result["skipped_automations"] = skipped
+        return result
+
+    def automations_acting_on(self, device_id: int) -> List[dict]:
+        """Reverse index for the rule-write gate: native automations
+        with an action step targeting ``device_id``.
+
+        Returns ``[{automation_type, id, name, roles}, ...]`` where
+        ``roles`` uses lite's vocabulary (``acts_on`` / ``condition``
+        / ``watches``). Only automations that ACT ON the device are
+        returned (``acts_on`` always present); the other roles ride
+        along as context. Raises the reader's friendly ``ValueError``
+        on DB failure — callers (mcp_tools) degrade to omitting the
+        informational block, never blocking the write path."""
+        reader = self._indidb()
+        data = reader.automations()
+        out: List[dict] = []
+        for kind in ("schedule", "trigger", "action_group"):
+            for record in data[kind].values():
+                try:
+                    roles: List[str] = []
+                    if any(
+                        step.get("device_id") == device_id
+                        for step in record.get("steps") or ()
+                    ):
+                        roles.append("acts_on")
+                    if self._condition_references(
+                        record.get("conditions"), device_id
+                    ):
+                        roles.append("condition")
+                    if kind == "trigger" and (
+                        (record.get("watch") or {}).get("device_id")
+                        == device_id
+                    ):
+                        roles.append("watches")
+                    if "acts_on" in roles:
+                        out.append(
+                            {
+                                "automation_type": kind,
+                                "id": record["id"],
+                                "name": record["name"],
+                                "roles": roles,
+                            }
+                        )
+                except (MemoryError, KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as exc:
+                    self.logger.warning(
+                        f"Automation reverse-index: skipping {kind} "
+                        f"id={record.get('id')}: {exc}"
+                    )
+                    continue
+        return out
+
+    @classmethod
+    def _condition_references(cls, node, device_id) -> bool:
+        """True if a decoded condition tree references the device."""
+        if not isinstance(node, dict):
+            return False
+        children = node.get("conditions")
+        if children is not None:
+            return any(
+                cls._condition_references(child, device_id)
+                for child in children
+            )
+        return node.get("device_id") == device_id
+
+    # -- compaction helpers -------------------------------------------
+
+    @staticmethod
+    def _ref(reader, collection: str, prefix: str, entity_id) -> dict:
+        """``{prefix}_id`` + best-effort ``{prefix}_name`` for a
+        referenced entity. Name stays an explicit ``None`` when the
+        live IOM can't resolve it — that's the orphaned-reference
+        signal the digest INSTRUCTIONS ask Claude to flag."""
+        if entity_id is None:
+            return {}
+        return {
+            f"{prefix}_id": entity_id,
+            f"{prefix}_name": reader.resolve_name(collection, entity_id),
+        }
+
+    def _compact_automation(self, kind: str, record: dict, reader) -> dict:
+        out = {
+            "automation_type": kind,
+            "id": record["id"],
+            "name": record["name"],
+            "steps": [
+                self._compact_step(step, reader)
+                for step in record.get("steps") or ()
+            ],
+        }
+        # enabled is only worth tokens when it's surprising (a disabled
+        # automation whose name still appeared in the fired window —
+        # e.g. disabled mid-week).
+        if record.get("enabled") is False:
+            out["enabled"] = False
+        conditions = self._compact_conditions(record.get("conditions"), reader)
+        if conditions is not None:
+            out["conditions"] = conditions
+        watch = record.get("watch")
+        if kind == "trigger" and watch:
+            out["watch"] = self._compact_watch(watch, reader)
+        return out
+
+    def _compact_step(self, step: dict, reader) -> dict:
+        """One decoded step → compact digest form: ``do`` carries the
+        action label (numeric code fallback, never guessed), raw
+        ``class``/code fields are dropped, referenced ids gain
+        resolved names."""
+        stype = step.get("type")
+        if stype in ("device_action", "hvac_action"):
+            out = {
+                "do": step.get("action_label")
+                or f"action_code_{step.get('action_code')}",
+                **self._ref(reader, "devices", "device", step.get("device_id")),
+            }
+            if step.get("action_value") is not None:
+                out["value"] = step["action_value"]
+            return out
+        if stype == "execute_action_group":
+            return {
+                "do": "execute_action_group",
+                **self._ref(
+                    reader, "actionGroups", "action_group",
+                    step.get("action_group_id"),
+                ),
+            }
+        if stype == "variable_action":
+            out = {
+                "do": step.get("action_label")
+                or f"variable_action_code_{step.get('action_code')}",
+                **self._ref(
+                    reader, "variables", "variable", step.get("variable_id")
+                ),
+            }
+            if step.get("value") is not None:
+                out["value"] = step["value"]
+            return out
+        if stype == "plugin_action":
+            out = {
+                "do": "plugin_action",
+                "label": step.get("label"),
+                "plugin_id": step.get("plugin_id"),
+            }
+            out.update(
+                self._ref(reader, "devices", "device", step.get("device_id"))
+            )
+            return out
+        if stype == "embedded_script":
+            source = step.get("source") or ""
+            return {
+                "do": "embedded_script",
+                "language": step.get("script_type_label")
+                or f"script_type_{step.get('script_type')}",
+                "source_excerpt": source[: self._SCRIPT_EXCERPT_AT],
+                "truncated": bool(step.get("truncated"))
+                or len(source) > self._SCRIPT_EXCERPT_AT,
+            }
+        return {"do": f"unknown_action_class_{step.get('class')}"}
+
+    def _compact_conditions(self, node, reader) -> Optional[dict]:
+        if not isinstance(node, dict):
+            return None
+        children = node.get("conditions")
+        if children is not None:
+            return {
+                "logic": node.get("logic")
+                or f"logic_code_{node.get('logic_code')}",
+                "conditions": [
+                    compacted
+                    for compacted in (
+                        self._compact_conditions(child, reader)
+                        for child in children
+                    )
+                    if compacted is not None
+                ],
+            }
+        ntype = node.get("type")
+        if ntype == "device_state":
+            out = {
+                **self._ref(reader, "devices", "device", node.get("device_id")),
+                "state": node.get("state"),
+                "comparator": node.get("comparator")
+                or f"comparator_code_{node.get('comparator_code')}",
+            }
+        elif ntype == "variable":
+            out = {
+                **self._ref(
+                    reader, "variables", "variable", node.get("variable_id")
+                ),
+                "comparator": node.get("comparator")
+                or f"comparator_code_{node.get('comparator_code')}",
+            }
+        elif ntype == "time_date":
+            return {
+                "time_window": {
+                    "start": node.get("start"),
+                    "end": node.get("end"),
+                }
+            }
+        else:
+            return {"type": ntype}
+        if node.get("value") not in (None, ""):
+            out["value"] = node["value"]
+        if node.get("value2"):
+            out["value2"] = node["value2"]
+        return out
+
+    def _compact_watch(self, watch: dict, reader) -> dict:
+        out: dict = {}
+        out.update(self._ref(reader, "devices", "device", watch.get("device_id")))
+        for key in ("state_selector", "state_value"):
+            if watch.get(key) not in (None, ""):
+                out[key] = watch[key]
+        out.update(
+            self._ref(reader, "variables", "variable", watch.get("variable_id"))
+        )
+        if watch.get("value") not in (None, ""):
+            out["value"] = watch["value"]
+        for key in ("plugin_id", "event_label"):
+            if watch.get(key):
+                out[key] = watch[key]
+        return out
 
     # ------------------------------------------------------------------
     # House model (devices, triggers, schedules, action groups)

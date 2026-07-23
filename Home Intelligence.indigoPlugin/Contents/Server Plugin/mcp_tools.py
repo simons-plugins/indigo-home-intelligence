@@ -91,7 +91,9 @@ def register_all(
     _register_digest_instructions_resource(handler)
 
     if safety_check is not None:
-        _register_propose_rule(handler, safety_check=safety_check)
+        _register_propose_rule(
+            handler, safety_check=safety_check, context=context, logger=logger,
+        )
         _register_add_rule(
             handler,
             rule_store=rule_store,
@@ -101,6 +103,7 @@ def register_all(
             send_rejection=send_rejection,
             after_write=after_write,
             logger=logger,
+            context=context,
         )
         _register_update_rule(
             handler, rule_store=rule_store,
@@ -413,7 +416,43 @@ _RULE_INPUT_SCHEMA = {
 }
 
 
-def _register_propose_rule(handler, *, safety_check) -> None:
+# Sentinel payload value for "the acting-on check could not run".
+# Tool descriptions define key-absence as "check ran, no conflicts",
+# so a FAILED check must surface distinctly — never as an all-clear.
+_LOOKUP_UNAVAILABLE = "unavailable"
+
+
+def _existing_automations(context, device_id, logger=None):
+    """Best-effort reverse-index lookup: native automations whose
+    action steps target ``device_id`` (via the copied .indiDb reader,
+    ADR-0010). NON-blocking and purely informational — the ADR-0006
+    safety allowlist is unchanged.
+
+    Returns a non-empty list of references, ``None`` when there is
+    nothing to report (no conflicts found, or the context has no
+    reverse-index capability), or ``_LOOKUP_UNAVAILABLE`` when the
+    lookup FAILED (DB mid-write, reader error) — callers put that
+    string in the payload so a failed check never reads as a
+    confident all-clear. The rule-write path itself never depends on
+    the database parse."""
+    lookup = getattr(context, "automations_acting_on", None)
+    if lookup is None:
+        return None
+    try:
+        existing = lookup(device_id)
+    except Exception as exc:
+        if logger is not None:
+            logger.warning(
+                f"Existing-automation lookup failed for device "
+                f"{device_id}: {exc}"
+            )
+        return _LOOKUP_UNAVAILABLE
+    return existing or None
+
+
+def _register_propose_rule(
+    handler, *, safety_check, context=None, logger=None,
+) -> None:
     def propose_rule(rule: dict) -> dict:
         from digest import DigestRunner
 
@@ -441,11 +480,17 @@ def _register_propose_rule(handler, *, safety_check) -> None:
         # import of plugin.py for callers that only validate.
         from plugin import _render_rule_human
 
-        return {
+        result = {
             "ok": True,
             "stage": "validated",
             "preview": _render_rule_human(rule),
         }
+        # Informational conflict signal: existing native automations
+        # acting on the same target device (non-blocking; ADR-0010).
+        existing = _existing_automations(context, target_id, logger)
+        if existing:
+            result["existing_automations"] = existing
+        return result
 
     handler.register_tool(
         name="propose_rule",
@@ -455,8 +500,15 @@ def _register_propose_rule(handler, *, safety_check) -> None:
             "show the user what a rule would look like before committing. "
             "Returns `ok: true` with a human-readable preview on success, "
             "or `ok: false` with the specific failure and stage "
-            "(schema / safety). Call `add_rule` afterwards to persist "
-            "if the user agrees."
+            "(schema / safety). When existing native Indigo automations "
+            "already act on the rule's target device, the response "
+            "includes an informational `existing_automations` list "
+            "(`{automation_type, id, name, roles}`) — surface it to the "
+            "user as a potential conflict before persisting. Key absent "
+            "= the check ran and found none; the string \"unavailable\" "
+            "= the check could not run (database unreadable) — do NOT "
+            "treat that as an all-clear. Call `add_rule` afterwards to "
+            "persist if the user agrees."
         ),
         input_schema={
             "type": "object",
@@ -478,6 +530,7 @@ def _register_add_rule(
     send_rejection,
     after_write,
     logger,
+    context=None,
 ) -> None:
     def add_rule(rule: dict, from_observation_id: Optional[str] = None) -> dict:
         from digest import DigestRunner
@@ -521,6 +574,12 @@ def _register_add_rule(
                 "target_device_id": target_id,
             }
 
+        # Look up conflicting native automations BEFORE writing so the
+        # confirmation payload can carry the signal even if the store
+        # write changes state. Informational only (ADR-0006 allowlist
+        # unchanged); reader failure degrades to omission.
+        existing = _existing_automations(context, target_id, logger)
+
         rule_id = rule_store.add_rule(rule)
         logger.info(f"MCP add_rule created agent rule {rule_id}")
 
@@ -554,7 +613,10 @@ def _register_add_rule(
             except Exception as exc:
                 logger.exception(f"after_write hook failed: {exc}")
 
-        return {"ok": True, "rule_id": rule_id}
+        result = {"ok": True, "rule_id": rule_id}
+        if existing:
+            result["existing_automations"] = existing
+        return result
 
     handler.register_tool(
         name="add_rule",
@@ -567,7 +629,13 @@ def _register_add_rule(
             "refused server-side. On success sends the same "
             "confirmation email as the Sunday-digest flow. If "
             "`from_observation_id` is supplied the observation's "
-            "user_response is set to `yes` with the new rule_id."
+            "user_response is set to `yes` with the new rule_id. The "
+            "success payload includes `existing_automations` (native "
+            "Indigo automations already acting on the target device) "
+            "when any exist — informational, relay it to the user. Key "
+            "absent = checked, none found; the string \"unavailable\" = "
+            "the check could not run — say so rather than implying no "
+            "conflicts."
         ),
         input_schema={
             "type": "object",
