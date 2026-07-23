@@ -20,6 +20,7 @@ Format: MADR 4.0.0 (https://adr.github.io/madr/). Template at
 * [ADR-0007](0007-weekly-email-optional.md) - ADR-0007: Make the weekly digest email optional, default off for new installs after v2
 * [ADR-0008](0008-general-indigo-mcp-supersede-by-lite.md) - ADR-0008: Cross-reference: workspace ADR-0003 supersedes the assumed-mlamoure default in HI's ADR-0003
 * [ADR-0009](0009-rehome-query-sql-logger-to-lite.md) - ADR-0009: Re-home query_sql_logger to indigo-mcp-lite
+* [ADR-0010](0010-copy-indidb-reader-from-lite.md) - ADR-0010: Consume automation contents via a copied indidb_reader, not lite's MCP tools
 
 <!-- adrlogstop -->
 

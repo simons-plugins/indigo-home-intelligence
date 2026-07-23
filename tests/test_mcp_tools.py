@@ -422,10 +422,36 @@ def fake_plugin_module(monkeypatch):
     return mod
 
 
+class _ReverseIndexContext:
+    """Context fake exposing automations_acting_on (ADR-0010 reverse
+    index) — returns a canned list or raises, recording calls."""
+
+    def __init__(self, existing=None, raises=None):
+        self._existing = existing or []
+        self._raises = raises
+        self.calls = []
+
+    def automations_acting_on(self, device_id):
+        self.calls.append(device_id)
+        if self._raises is not None:
+            raise self._raises
+        return list(self._existing)
+
+
+_EXISTING_REF = {
+    "automation_type": "schedule", "id": 300,
+    "name": "Evening Off", "roles": ["acts_on"],
+}
+
+
 class TestProposeRule:
-    def _register(self, handler, safety_check=lambda _id: True):
+    def _register(self, handler, safety_check=lambda _id: True,
+                  context=None):
         import mcp_tools
-        mcp_tools._register_propose_rule(handler, safety_check=safety_check)
+        mcp_tools._register_propose_rule(
+            handler, safety_check=safety_check, context=context,
+            logger=logging.getLogger("test-propose"),
+        )
 
     def test_valid_rule_returns_preview(self, handler, fake_plugin_module):
         self._register(handler, safety_check=lambda _id: True)
@@ -461,12 +487,51 @@ class TestProposeRule:
         assert "thermostat" in rationale
         assert "dimmer" in rationale or "relay" in rationale
 
+    def test_existing_automations_included_when_present(
+            self, handler, fake_plugin_module):
+        ctx = _ReverseIndexContext(existing=[_EXISTING_REF])
+        self._register(handler, context=ctx)
+        body = _call_tool(handler, "propose_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        assert payload["existing_automations"] == [_EXISTING_REF]
+        # Looked up against the rule's TARGET device (then.device_id).
+        assert ctx.calls == [200]
+
+    def test_existing_automations_absent_when_none_act_on_target(
+            self, handler, fake_plugin_module):
+        self._register(handler, context=_ReverseIndexContext(existing=[]))
+        body = _call_tool(handler, "propose_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        assert "existing_automations" not in payload
+
+    def test_reader_failure_degrades_to_omission_not_error(
+            self, handler, fake_plugin_module):
+        # NON-blocking contract: a mid-write .indiDb parse must never
+        # fail the preview — the key is just omitted.
+        ctx = _ReverseIndexContext(raises=ValueError("mid-write; retry"))
+        self._register(handler, context=ctx)
+        body = _call_tool(handler, "propose_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        assert "existing_automations" not in payload
+
+    def test_no_context_keeps_legacy_shape(self, handler, fake_plugin_module):
+        # register_all callers that pass no context (or a context
+        # without the reverse index) get the pre-#27 response shape.
+        self._register(handler, context=None)
+        body = _call_tool(handler, "propose_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        assert "existing_automations" not in payload
+
 
 class TestAddRule:
     def _register(self, handler, *, safety_check=lambda _id: True,
                   rule_store=None, observation_store=None,
                   send_confirmation=None, send_rejection=None,
-                  after_write=None, logger=None):
+                  after_write=None, logger=None, context=None):
         import mcp_tools
         mcp_tools._register_add_rule(
             handler,
@@ -477,6 +542,7 @@ class TestAddRule:
             send_rejection=send_rejection,
             after_write=after_write,
             logger=logger or logging.getLogger("test-add-rule"),
+            context=context,
         )
 
     def test_writes_rule_and_sends_confirmation_when_safe(self, handler):
@@ -581,6 +647,37 @@ class TestAddRule:
             "from_observation_id": "nope",
         })
         assert body["result"]["isError"] is True
+
+    def test_existing_automations_in_confirmation_payload(self, handler):
+        rs = _CapturingRuleStore()
+        ctx = _ReverseIndexContext(existing=[_EXISTING_REF])
+        self._register(handler, rule_store=rs, context=ctx)
+        body = _call_tool(handler, "add_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        # NON-blocking: rule written AND the conflict signal rides in
+        # the confirmation payload.
+        assert payload["ok"] is True
+        assert payload["rule_id"] == "rule-1"
+        assert payload["existing_automations"] == [_EXISTING_REF]
+        assert len(rs.added) == 1
+        assert ctx.calls == [200]  # then.device_id, the actuated target
+
+    def test_existing_automations_absent_when_none(self, handler):
+        self._register(handler, context=_ReverseIndexContext(existing=[]))
+        body = _call_tool(handler, "add_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        assert "existing_automations" not in payload
+
+    def test_reader_failure_still_writes_rule(self, handler):
+        rs = _CapturingRuleStore()
+        ctx = _ReverseIndexContext(raises=ValueError("db unavailable"))
+        self._register(handler, rule_store=rs, context=ctx)
+        body = _call_tool(handler, "add_rule", {"rule": _valid_rule()})
+        payload = json.loads(body["result"]["content"][0]["text"])
+        assert payload["ok"] is True
+        assert "existing_automations" not in payload
+        assert len(rs.added) == 1
 
 
 class TestUpdateRule:

@@ -54,6 +54,11 @@ GOALS
   code, no DSL.
 - Never re-suggest something the owner has already declined or that is
   already automated by an existing trigger, schedule, or agent rule.
+  When the ``automation_contents`` block is present it is AUTHORITATIVE
+  for what fired automations actually do — check the decoded steps and
+  conditions, not just automation names, before concluding a behaviour
+  is (or isn't) already automated. A schedule called "Night" may
+  already do exactly what you were about to propose.
 
 HEALTH & ENERGY SIGNALS
 The ``event_log_summary`` block carries three additional sub-sections
@@ -102,13 +107,53 @@ How to use them in the narrative:
   suggest a Z-Wave network optimise or physically checking/relocating
   the node or a nearby repeater.
 
+AUTOMATION CONTENTS
+When native automations fired during the window,
+``event_log_summary.automation_contents`` carries their DECODED
+contents, read from the Indigo database file (not guessed from
+names):
+
+- ``automations``: up to 40 entries, each
+  ``{automation_type, id, name, steps, conditions?, watch?}``.
+  ``automation_type`` is schedule / trigger / action_group. ``steps``
+  are the decoded action steps in order — ``do`` names the action
+  (turn_on, turn_off, set_heat_setpoint, execute_action_group,
+  embedded_script, plugin_action, ...) and referenced entities carry
+  both id and resolved name (``device_id``/``device_name``,
+  ``variable_id``/``variable_name``, ``action_group_id``/
+  ``action_group_name``). ``conditions`` is the condition tree
+  (``logic`` all/any + leaves). ``watch`` (triggers only) is what the
+  trigger fires on.
+- ``matched_total``: fired automations matched before the 40-entry
+  cap.
+- ``skipped_automations``: present when the database parse skipped
+  records — treat the block as partial.
+
+How to use it:
+- Treat the decoded steps as the ground truth for "is this already
+  automated?" — the block exists precisely so you don't have to infer
+  an automation's effect from its name.
+- Conflict check: when two automations act on the SAME device with
+  overlapping or opposing effects (e.g. a schedule turns it off in a
+  window where a trigger turns it on), that is a digest-worthy
+  observation — name both automations and the device.
+- Orphaned references: a step, condition, or watch whose
+  ``device_name`` / ``variable_name`` / ``action_group_name`` is null
+  references something that no longer exists — the automation is
+  likely broken or stale. Flag it the same way you'd flag an
+  auto-disabled rule.
+- The block covers only automations that FIRED this week; an
+  automation absent here may still exist (see the HOUSE MODEL lists).
+  The block itself may be absent on weeks where nothing fired or the
+  database file was unreadable.
+
 EVENT LOG FORMAT
 The event log is delivered in two fenced code blocks in the user message:
 
 - ``event_log_summary`` — one compact JSON object with aggregate counts
   (``total_events``, ``top_sources``, ``events_by_hour``,
-  ``sql_logger_rollups``, plus the ``health``, ``energy``, and
-  ``zwave_mesh`` blocks described above).
+  ``sql_logger_rollups``, plus the ``health``, ``energy``,
+  ``zwave_mesh``, and ``automation_contents`` blocks described above).
 - ``event_log_timeline`` — JSON-lines, chronological, one **positional
   array** per line with the shape
   ``["YYYY-MM-DD HH:MM:SS", source, message]``. Milliseconds are
@@ -309,6 +354,7 @@ class DigestRunner:
             event_summary["sql_logger_rollups"] = self.context.sql_rollups()
             event_summary["health"] = self.context.fleet_health()
             event_summary["energy"] = self.context.energy_context()
+            self._attach_automation_contents(event_summary, events)
             mesh_snapshot = None
             if self.mesh_store is not None:
                 mesh = self.context.zwave_mesh_health(self.mesh_store.read())
@@ -386,6 +432,51 @@ class DigestRunner:
         if result is not None and self.mesh_store is not None and mesh_snapshot:
             self.mesh_store.write(mesh_snapshot)
         return result
+
+    # ------------------------------------------------------------------
+    # Automation contents (ADR-0010)
+    # ------------------------------------------------------------------
+
+    # Event-log sources whose message narrates an automation firing —
+    # for these lines the message IS the automation's name (see
+    # event_log_reader._USEFUL_TYPE_STR; "Auto Lights" is the plugin's
+    # own zone logic, not a native automation, so it's excluded here).
+    _FIRED_SOURCES = frozenset({"Trigger", "Schedule", "Action Group"})
+
+    @classmethod
+    def _fired_automation_names(cls, events: List[dict]) -> set:
+        """Names of native automations that fired in the window,
+        extracted from Trigger / Schedule / Action Group timeline
+        lines. Scopes the automation-contents block to what actually
+        ran (issue #27's token-scoping decision)."""
+        fired = set()
+        for event in events:
+            if event.get("source") in cls._FIRED_SOURCES:
+                name = (event.get("message") or "").strip()
+                if name:
+                    fired.add(name)
+        return fired
+
+    def _attach_automation_contents(
+        self, event_summary: dict, events: List[dict]
+    ) -> None:
+        """Attach decoded contents for automations that fired this
+        week. Best-effort: any failure (database mid-write, path
+        unavailable) degrades to an ABSENT block with a warning — the
+        digest must never be blocked by the .indiDb parse."""
+        try:
+            fired = self._fired_automation_names(events)
+            if not fired:
+                return
+            contents = self.context.automation_contents_context(fired)
+            if contents.get("automations"):
+                event_summary["automation_contents"] = contents
+        except (MemoryError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as exc:
+            self.logger.warning(
+                f"Automation contents unavailable for this digest: {exc}"
+            )
 
     # ------------------------------------------------------------------
     # Prompt construction
