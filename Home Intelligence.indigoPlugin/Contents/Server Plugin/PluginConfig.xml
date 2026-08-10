@@ -50,6 +50,14 @@
            visibleBindingId="dbType" visibleBindingValue="postgresql">
         <Label>Database name:</Label>
     </Field>
+    <Field id="pgTimezone" type="textfield" defaultValue="Europe/London"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>Timezone:</Label>
+    </Field>
+    <Field id="pgTimezoneHelp" type="label" fontSize="small" fontColor="darkgray"
+           visibleBindingId="dbType" visibleBindingValue="postgresql">
+        <Label>IANA zone name (e.g. Europe/London) SQL Logger's naive timestamps are stored in. Falls back to Europe/London if left blank or unrecognised.</Label>
+    </Field>
 
     <Field id="separator2" type="separator" />
 
