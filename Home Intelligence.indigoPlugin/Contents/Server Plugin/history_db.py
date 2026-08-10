@@ -2,10 +2,13 @@
 Database abstraction for reading Indigo SQL Logger history data.
 Supports SQLite and PostgreSQL backends (read-only access).
 
-The naive-local ``ts`` / text-column query paths are now aligned with
-indigo-mcp-lite's trimmed copy of this module (issues #48, #49) — see
-that module's header for the differences that remain by design (strict
-column allowlist there, none here; PG-only write-guard phrasing).
+The naive-local ``ts`` / text-column query paths are aligned with
+indigo-mcp-lite's trimmed copy of this module (its issues #48, #49; HI
+issue #30). Differences that remain by design: lite has a ``from_prefs``
+classmethod (HI wires prefs in ``plugin.py``); HI carries the digest's
+``rollup_7d`` / ``discover_energy_tables`` / ``energy_rollup_14d``,
+which lite trims; the ``_PG_ERROR_HINTS`` strings name each plugin's
+own Configure labels.
 """
 import glob
 import os
@@ -393,6 +396,10 @@ class HistoryDB:
 
         points = []
         for row in rows:
+            # psql --unaligned can trim trailing NULL fields, so a row can
+            # come back with fewer tab-separated values than selected.
+            if len(row) < 2:
+                continue
             epoch_raw = row[0]
             value_raw = row[1]
             if epoch_raw is None or epoch_raw == "":
@@ -409,9 +416,15 @@ class HistoryDB:
                 elif value_raw == "":
                     continue
                 else:
-                    value = float(value_raw)
+                    try:
+                        value = float(value_raw)
+                    except ValueError:
+                        continue  # text value in the series — skip, don't abort
             elif value_raw is not None:
-                value = float(value_raw)
+                try:
+                    value = float(value_raw)
+                except (TypeError, ValueError):
+                    continue
             else:
                 continue
             points.append({"t": epoch, "v": value})
@@ -442,6 +455,10 @@ class HistoryDB:
 
         points = []
         for row in rows:
+            # psql --unaligned can trim trailing NULL fields, so a row can
+            # come back with fewer tab-separated values than selected.
+            if len(row) < 2:
+                continue
             epoch_raw = row[0]
             value_raw = row[1]
             if epoch_raw is None or epoch_raw == "":

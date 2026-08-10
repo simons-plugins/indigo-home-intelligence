@@ -224,7 +224,7 @@ def sqlite_text_db(tmp_path):
         "id INTEGER PRIMARY KEY, ts TIMESTAMP, operationState TEXT)"
     )
     now = (int(time.time()) // 10800) * 10800 + 5400
-    if now < time.time() - 1200:
+    if now < time.time() - 600:
         now += 10800
     states = ["Ready", "Run", "Run", "Finished", "Idle"]
     rows = [(i, _ts(now - 600 * i), states[i]) for i in range(5)]
