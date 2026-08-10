@@ -20,7 +20,7 @@ from datetime import datetime, timezone
 import indigo
 
 from data_access import HouseContextAccess
-from history_db import HistoryDB
+from history_db import DEFAULT_PG_TIMEZONE, HistoryDB
 from rule_store import RuleStore
 from rule_evaluator import RuleEvaluator
 from observation_store import ObservationStore
@@ -959,8 +959,12 @@ class Plugin(indigo.PluginBase):
                 pg_user=pg_user,
                 pg_password=self.pluginPrefs.get("pgPassword", ""),
                 pg_database=pg_database,
+                pg_timezone=self.pluginPrefs.get("pgTimezone", DEFAULT_PG_TIMEZONE),
             )
-            target = f"postgresql @ {pg_host}/{pg_database} (user: {pg_user!r})"
+            target = (
+                f"postgresql @ {pg_host}/{pg_database} (user: {pg_user!r}, "
+                f"ts read as {self.history_db.pg_timezone})"
+            )
         else:
             sqlite_path = self.pluginPrefs.get("sqlitePath", "") or None
             self.history_db = HistoryDB(
