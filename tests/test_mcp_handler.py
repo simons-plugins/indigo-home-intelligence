@@ -54,6 +54,11 @@ class TestTransport:
         resp = handler.handle_request("GET", {}, "")
         assert resp["status"] == 405
         assert resp["headers"]["Allow"] == "POST"
+        # IWS turns an empty content string into a 500 ("incorrect value
+        # returned from plugin"), so the 405 must carry a body.
+        assert resp["content"], "405 content must be non-empty for IWS"
+        assert resp["headers"]["Content-Type"].startswith("application/json")
+        assert json.loads(resp["content"])["error"] == "method_not_allowed"
 
     def test_rejects_incompatible_accept(self, handler):
         resp = handler.handle_request(
