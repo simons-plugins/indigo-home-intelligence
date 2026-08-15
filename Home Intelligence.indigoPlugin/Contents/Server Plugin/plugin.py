@@ -619,18 +619,24 @@ class Plugin(indigo.PluginBase):
         if isinstance(body_raw, (bytes, bytearray)):
             try:
                 body = body_raw.decode("utf-8", errors="replace")
-            except Exception:
+            except Exception as exc:
+                self.logger.warning(
+                    f"MCP request body decode failed, treating as empty: {exc}"
+                )
                 body = ""
         else:
             body = body_raw or ""
         try:
             return self.mcp.handle_request(http_method, headers, body)
         except Exception as exc:
+            # Mirrors the inner handler's discipline at mcp_handler.py
+            # (-32603 "Internal error"): keep exception detail in logs,
+            # return a fixed message to avoid leaking paths/types.
             self.logger.exception(f"MCP handler raised: {exc}")
             return {
                 "status": 500,
                 "headers": {"Content-Type": "application/json"},
-                "content": json.dumps({"error": str(exc)}),
+                "content": json.dumps({"error": "internal_error"}),
             }
 
     def handle_run_digest(self, action, dev=None, callerWaitingForResult=None):
