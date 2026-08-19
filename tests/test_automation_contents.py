@@ -375,11 +375,133 @@ class TestAutomationsActingOn:
     def test_untouched_device_returns_empty(self, ctx):
         assert ctx.automations_acting_on(987654) == []
 
-    def test_reader_failure_propagates(self):
-        ctx = HouseContextAccess(history_db=None, logger=MagicMock())
+    def test_reader_failure_propagates(self, ctx):
+        # Uses the wired ctx so the live-device probe SUCCEEDS and the
+        # reader's ValueError is unambiguously what propagates —
+        # otherwise a bare stub fails the probe first and this asserts
+        # the wrong failure.
         ctx._indidb_reader = _FakeReader(raises=ValueError("no path"))
         with pytest.raises(ValueError, match="no path"):
             ctx.automations_acting_on(111)
+
+
+def _props_reader(props, *, kind="action_group", rec_id=900):
+    """Reader stand-in holding ONE automation whose single step is a
+    plugin action carrying ``props``. The XML decoding of props is
+    covered by the reader tests; what matters here is the walk."""
+    record = {"id": rec_id, "name": "Props Driver", "conditions": None,
+              "steps": [{"type": "plugin_action", "props": props}]}
+    empty = {"schedule": {}, "trigger": {}, "action_group": {}}
+    empty[kind] = {rec_id: record}
+    return _FakeReader(data=empty)
+
+
+class TestActingOnViaProps:
+    """The rule-write gate's half of lite #59: a plugin step naming
+    the device only in its own parameters still counts as acting on
+    it, so the gate stops under-reporting native conflicts."""
+
+    def test_props_only_device_now_counts_as_acting_on(self, ctx):
+        ctx._indidb_reader = _props_reader({"device-id": 111})
+        refs = ctx.automations_acting_on(111)
+        assert len(refs) == 1
+        assert refs[0]["roles"] == ["acts_on_via_props"]
+        assert refs[0]["matched_props"] == ["device-id"]
+
+    def test_declared_and_inferred_collapse_to_one_entry(self, ctx):
+        reader = _props_reader({"device-id": 111})
+        reader._data["action_group"][900]["steps"].append(
+            {"type": "device_action", "device_id": 111}
+        )
+        ctx._indidb_reader = reader
+        refs = ctx.automations_acting_on(111)
+        assert len(refs) == 1
+        assert refs[0]["roles"] == ["acts_on", "acts_on_via_props"]
+
+    def test_nested_and_comma_separated_props_are_walked(self, ctx):
+        ctx._indidb_reader = _props_reader({
+            "zones": {"primary": 111},
+            "sensorDevices": "222, 111 ,987654",
+        })
+        refs = ctx.automations_acting_on(111)
+        assert refs[0]["matched_props"] == ["sensorDevices", "zones.primary"]
+
+    def test_id_shaped_value_for_a_device_that_does_not_exist(self, ctx):
+        # 987654 is not in the live collection, so a matching prop
+        # value could equally be a level or a delay — inferring a
+        # reference from it would be worse than reporting none.
+        ctx._indidb_reader = _props_reader({"deepLinkPageId": 987654})
+        assert ctx.automations_acting_on(987654) == []
+
+    def test_bool_and_float_props_never_match(self, ctx):
+        # isinstance(True, int) is True, and a `real` prop is a level.
+        ctx._indidb_reader = _props_reader(
+            {"isOn": True, "brightness": 111.0}
+        )
+        assert ctx.automations_acting_on(111) == []
+
+    def test_props_matched_on_schedules_and_triggers_too(self, ctx):
+        for kind in ("schedule", "trigger"):
+            ctx._indidb_reader = _props_reader(
+                {"device-id": 111}, kind=kind
+            )
+            refs = ctx.automations_acting_on(111)
+            assert [r["automation_type"] for r in refs] == [kind], kind
+
+    def test_failed_device_lookup_is_not_a_quiet_partial_answer(
+        self, ctx, monkeypatch,
+    ):
+        # The gate exists to warn about conflicting native automations
+        # before a rule write. If the live lookup fails, props were
+        # never searched — returning the declared-only list would read
+        # as complete. mcp_tools turns this into _LOOKUP_UNAVAILABLE.
+        class _Exploding:
+            def __getitem__(self, key):
+                raise RuntimeError("IOM busy")
+
+        monkeypatch.setattr(
+            data_access.indigo, "devices", _Exploding(), raising=False
+        )
+        ctx._indidb_reader = _props_reader({"device-id": 111})
+        with pytest.raises(RuntimeError, match="not searched"):
+            ctx.automations_acting_on(111)
+
+    def test_device_probe_runs_before_the_database_parse(
+        self, ctx, monkeypatch,
+    ):
+        # Fail fast: the probe is cheap, the parse reads ~9MB. If the
+        # probe is going to abort the call, it must do so before that
+        # work, not after. A reader that would raise proves the order.
+        class _Exploding:
+            def __getitem__(self, key):
+                raise RuntimeError("IOM busy")
+
+        monkeypatch.setattr(
+            data_access.indigo, "devices", _Exploding(), raising=False
+        )
+        ctx._indidb_reader = _FakeReader(raises=ValueError("parsed!"))
+        with pytest.raises(RuntimeError, match="not searched"):
+            ctx.automations_acting_on(111)
+
+    def test_props_walk_failure_cannot_discard_a_declared_match(self, ctx):
+        # The inferred pass is the newer, more speculative half. If it
+        # ever throws, the declared conflict this record genuinely has
+        # must still be reported — losing it would be the exact
+        # under-report the whole feature exists to close.
+        class _Hostile(dict):
+            def items(self):
+                raise RuntimeError("props exploded")
+
+        reader = _props_reader(_Hostile())
+        reader._data["action_group"][900]["steps"].append(
+            {"type": "device_action", "device_id": 111}
+        )
+        ctx._indidb_reader = reader
+        refs = ctx.automations_acting_on(111)
+        assert len(refs) == 1
+        assert refs[0]["roles"] == ["acts_on"]
+        assert "matched_props" not in refs[0]
+        assert ctx.logger.warning.called   # degraded, never silent
 
 
 # ---------------------------------------------------------------------

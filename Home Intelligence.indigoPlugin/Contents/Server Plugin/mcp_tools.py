@@ -424,14 +424,16 @@ _LOOKUP_UNAVAILABLE = "unavailable"
 
 def _existing_automations(context, device_id, logger=None):
     """Best-effort reverse-index lookup: native automations whose
-    action steps target ``device_id`` (via the copied .indiDb reader,
-    ADR-0010). NON-blocking and purely informational — the ADR-0006
+    action steps target ``device_id`` — declared in a device field, or
+    named inside a plugin action's own parameters (via the copied
+    .indiDb reader, ADR-0010). NON-blocking and purely informational — the ADR-0006
     safety allowlist is unchanged.
 
     Returns a non-empty list of references, ``None`` when there is
     nothing to report (no conflicts found, or the context has no
     reverse-index capability), or ``_LOOKUP_UNAVAILABLE`` when the
-    lookup FAILED (DB mid-write, reader error) — callers put that
+    lookup FAILED (DB mid-write, reader error, or a live-device
+    lookup failure that left plugin parameters unsearched) — callers put that
     string in the payload so a failed check never reads as a
     confident all-clear. The rule-write path itself never depends on
     the database parse."""
@@ -503,10 +505,15 @@ def _register_propose_rule(
             "(schema / safety). When existing native Indigo automations "
             "already act on the rule's target device, the response "
             "includes an informational `existing_automations` list "
-            "(`{automation_type, id, name, roles}`) — surface it to the "
-            "user as a potential conflict before persisting. Key absent "
+            "(`{automation_type, id, name, roles}`, plus "
+            "`matched_props` when the automation names the device "
+            "inside a plugin action's parameters rather than a device "
+            "field — Indigo's own dependency check misses those) — "
+            "surface it to the user as a potential conflict before "
+            "persisting. Key absent "
             "= the check ran and found none; the string \"unavailable\" "
-            "= the check could not run (database unreadable) — do NOT "
+            "= the check could not run (database unreadable, or the "
+            "device lookup failed) — do NOT "
             "treat that as an all-clear. Call `add_rule` afterwards to "
             "persist if the user agrees."
         ),
@@ -631,8 +638,10 @@ def _register_add_rule(
             "`from_observation_id` is supplied the observation's "
             "user_response is set to `yes` with the new rule_id. The "
             "success payload includes `existing_automations` (native "
-            "Indigo automations already acting on the target device) "
-            "when any exist — informational, relay it to the user. Key "
+            "Indigo automations already acting on the target device, "
+            "including those that name it only inside a plugin "
+            "action's parameters) when any exist — informational, "
+            "relay it to the user. Key "
             "absent = checked, none found; the string \"unavailable\" = "
             "the check could not run — say so rather than implying no "
             "conflicts."
