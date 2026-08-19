@@ -70,9 +70,36 @@ asking.
 
 | Tool | What it does |
 |---|---|
-| `propose_rule(rule)` | Validate schema + safety allowlist, no write. Returns a human-readable preview on success. Intended as "show the user what this rule would look like before committing." |
+| `propose_rule(rule)` | Validate schema + safety allowlist, no write. Returns a human-readable preview on success. Intended as "show the user what this rule would look like before committing." Also reports conflicting native automations — see below. |
 | `add_rule(rule, from_observation_id?)` | Persist the rule after propose_rule has validated it. Sends the same confirmation email as the Sunday-digest YES flow. If `from_observation_id` is set, updates the observation's `user_response`. |
 | `update_rule(rule_id, action)` | Actions: `disable`, `enable`, `delete`. `enable` also clears auto-disabled metadata so the evaluator's failure counter resets. `delete` is permanent. |
+
+#### Conflicting native automations
+
+`propose_rule` and `add_rule` both return an informational
+`existing_automations` list when Indigo triggers, schedules, or action
+groups already act on the rule's target device — so a rule isn't
+written blind into a conflict. Entries are
+`{automation_type, id, name, roles}`.
+
+`roles` distinguishes how the automation reaches the device:
+
+| Role | Meaning |
+|---|---|
+| `acts_on` | A declared action step targets the device. |
+| `acts_on_via_props` | A **plugin** action step names the device only inside its own parameters (`device-id`, `dimmer_device_id`, a comma-separated list). Entries also carry `matched_props` naming the parameters that matched, because this is an *inferred* reference rather than a declared one. |
+| `condition` | The device appears in the condition tree. |
+| `watches` | A trigger fires on the device. |
+
+`acts_on_via_props` matters more than it sounds: **Indigo's own
+dependency check cannot see those references at all.** On the
+development server, 13 devices had zero declared references while
+being genuinely driven — one of them by eight action groups. Without
+this the gate would have reported no conflict for every one of them.
+
+The key is absent when the check ran and found nothing. The string
+`"unavailable"` means the check could not run (database mid-write, or
+the device lookup failed) — **not** an all-clear.
 
 ### Resource
 
