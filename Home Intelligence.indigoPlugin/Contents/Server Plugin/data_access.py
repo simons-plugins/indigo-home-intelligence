@@ -621,6 +621,36 @@ class HouseContextAccess:
         watch = record.get("watch")
         if kind == "trigger" and watch:
             out["watch"] = self._compact_watch(watch, reader)
+        schedule = record.get("schedule")
+        if kind == "schedule" and schedule:
+            out["fires"] = self._compact_schedule(schedule)
+        return out
+
+    @staticmethod
+    def _compact_schedule(schedule: dict) -> dict:
+        """A schedule's firing rule → compact digest form.
+
+        The digest's "is this already automated?" reasoning needs the
+        rule, not the next timestamp: an absolute 06:00 schedule and
+        one tracking sunrise are the same single datetime to
+        next_execution. Raw codes are dropped (the labels cover every
+        value seen live) and zero-valued offsets stay out.
+        """
+        out = {"when": schedule.get("time_type")
+               or f"time_type_code_{schedule.get('time_type_code')}"}
+        for key, out_key in (
+            ("time", "at"),
+            ("sun_offset_seconds", "offset_seconds"),
+            ("interval_seconds", "every_seconds"),
+            ("randomize_seconds", "randomize_seconds"),
+            ("days_of_week", "days"),
+        ):
+            value = schedule.get(key)
+            if value:
+                out[out_key] = value
+        days_interval = schedule.get("repeat_interval_days")
+        if days_interval and days_interval > 1:
+            out["every_n_days"] = days_interval
         return out
 
     def _compact_step(self, step: dict, reader) -> dict:
@@ -719,6 +749,11 @@ class HouseContextAccess:
                     "end": node.get("end"),
                 }
             }
+        elif ntype == "sun":
+            # "is it dark/light outside" — the generic fallthrough
+            # below would keep the type and drop the state, which is
+            # the only part that means anything.
+            return {"sun": node.get("state") or f"type_code_{node.get('type_code')}"}
         else:
             return {"type": ntype}
         if node.get("value") not in (None, ""):
