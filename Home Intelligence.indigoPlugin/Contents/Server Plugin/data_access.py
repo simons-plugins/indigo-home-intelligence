@@ -539,6 +539,14 @@ class HouseContextAccess:
         ``matched_props`` naming the parameters that matched, because
         it is an INFERRED reference, not a declared one.
 
+        When ``device_id`` names no live device the inferred pass is
+        skipped silently and only declared references are returned —
+        a prop value matching an id that exists nowhere could equally
+        be an ordinary parameter. The rule-write gate can't reach
+        that case (its safety allowlist already requires a live
+        device), but a future caller without that precondition would
+        get a quietly declared-only answer.
+
         Raises the reader's friendly ``ValueError`` on DB failure, and
         RuntimeError when the live-device lookup fails — callers
         (mcp_tools) degrade to ``_LOOKUP_UNAVAILABLE``, never blocking
@@ -546,8 +554,6 @@ class HouseContextAccess:
         exists so a rule-write is warned about conflicting native
         automations, and a partial list would read as a complete
         one."""
-        reader = self._indidb()
-        data = reader.automations()
         presence = self._entity_presence("devices", device_id)
         if presence == "unavailable":
             raise RuntimeError(
@@ -555,6 +561,8 @@ class HouseContextAccess:
                 "plugin action parameters were not searched"
             )
         match_props = presence == "present"
+        reader = self._indidb()
+        data = reader.automations()
         out: List[dict] = []
         for kind in ("schedule", "trigger", "action_group"):
             for record in data[kind].values():
@@ -567,9 +575,30 @@ class HouseContextAccess:
                         roles.append("acts_on")
                     matched_props: Set[str] = set()
                     if match_props:
-                        for step in record.get("steps") or ():
-                            matched_props.update(
-                                self._step_prop_references(step, device_id)
+                        # Isolated from the enclosing per-record catch
+                        # on purpose: the inference is the newer, more
+                        # speculative half, and a failure in it must
+                        # never discard an `acts_on` already found for
+                        # this record. Dropping a declared conflict
+                        # because the inferred pass tripped would be
+                        # the exact under-report this index exists to
+                        # close.
+                        try:
+                            for step in record.get("steps") or ():
+                                matched_props.update(
+                                    self._step_prop_references(
+                                        step, device_id
+                                    )
+                                )
+                        except (MemoryError, KeyboardInterrupt,
+                                SystemExit):
+                            raise
+                        except Exception as exc:
+                            matched_props = set()
+                            self.logger.warning(
+                                f"Automation reverse-index: props walk "
+                                f"failed for {kind} "
+                                f"id={record.get('id')}: {exc}"
                             )
                     if matched_props:
                         roles.append("acts_on_via_props")
@@ -664,8 +693,18 @@ class HouseContextAccess:
 
     @classmethod
     def _step_prop_references(cls, step, entity_id) -> List[str]:
-        """Prop paths in a step naming ``entity_id``."""
-        return list(cls._iter_prop_matches(step.get("props"), entity_id))
+        """Prop paths in a step (and any nested group) naming
+        ``entity_id``."""
+        matches = list(
+            cls._iter_prop_matches(step.get("props"), entity_id)
+        )
+        nested = step.get("action_group")
+        if nested:  # never populated in raw reader records, cheap guard
+            for child in nested.get("steps", ()):
+                matches.extend(
+                    cls._step_prop_references(child, entity_id)
+                )
+        return matches
 
     @classmethod
     def _condition_references(cls, node, device_id) -> bool:

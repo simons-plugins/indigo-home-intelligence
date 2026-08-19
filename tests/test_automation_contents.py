@@ -375,8 +375,11 @@ class TestAutomationsActingOn:
     def test_untouched_device_returns_empty(self, ctx):
         assert ctx.automations_acting_on(987654) == []
 
-    def test_reader_failure_propagates(self):
-        ctx = HouseContextAccess(history_db=None, logger=MagicMock())
+    def test_reader_failure_propagates(self, ctx):
+        # Uses the wired ctx so the live-device probe SUCCEEDS and the
+        # reader's ValueError is unambiguously what propagates —
+        # otherwise a bare stub fails the probe first and this asserts
+        # the wrong failure.
         ctx._indidb_reader = _FakeReader(raises=ValueError("no path"))
         with pytest.raises(ValueError, match="no path"):
             ctx.automations_acting_on(111)
@@ -462,6 +465,43 @@ class TestActingOnViaProps:
         ctx._indidb_reader = _props_reader({"device-id": 111})
         with pytest.raises(RuntimeError, match="not searched"):
             ctx.automations_acting_on(111)
+
+    def test_device_probe_runs_before_the_database_parse(
+        self, ctx, monkeypatch,
+    ):
+        # Fail fast: the probe is cheap, the parse reads ~9MB. If the
+        # probe is going to abort the call, it must do so before that
+        # work, not after. A reader that would raise proves the order.
+        class _Exploding:
+            def __getitem__(self, key):
+                raise RuntimeError("IOM busy")
+
+        monkeypatch.setattr(
+            data_access.indigo, "devices", _Exploding(), raising=False
+        )
+        ctx._indidb_reader = _FakeReader(raises=ValueError("parsed!"))
+        with pytest.raises(RuntimeError, match="not searched"):
+            ctx.automations_acting_on(111)
+
+    def test_props_walk_failure_cannot_discard_a_declared_match(self, ctx):
+        # The inferred pass is the newer, more speculative half. If it
+        # ever throws, the declared conflict this record genuinely has
+        # must still be reported — losing it would be the exact
+        # under-report the whole feature exists to close.
+        class _Hostile(dict):
+            def items(self):
+                raise RuntimeError("props exploded")
+
+        reader = _props_reader(_Hostile())
+        reader._data["action_group"][900]["steps"].append(
+            {"type": "device_action", "device_id": 111}
+        )
+        ctx._indidb_reader = reader
+        refs = ctx.automations_acting_on(111)
+        assert len(refs) == 1
+        assert refs[0]["roles"] == ["acts_on"]
+        assert "matched_props" not in refs[0]
+        assert ctx.logger.warning.called   # degraded, never silent
 
 
 # ---------------------------------------------------------------------
