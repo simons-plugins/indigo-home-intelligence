@@ -32,6 +32,41 @@ from mcp_handler import MCPHandler
 import mcp_tools
 
 
+# MCP ``instructions`` (InitializeResult) — read once, up front,
+# before any tool is chosen, so it is the only place the boundary
+# between this server and indigo-mcp-lite can be stated. The most
+# expensive mistake a client can make here is reaching for HI to
+# read or control the live house; it does neither.
+SERVER_INSTRUCTIONS = """\
+Home Intelligence: the weekly-digest and rule-store side of Simon's
+Indigo setup. It is NOT a general Indigo API — for live device state,
+control, search, or automation contents, use the indigo-mcp-lite
+server instead. HI answers four questions lite cannot:
+
+- WHAT HAS THE HOUSE BEEN DOING — house_context_snapshot returns the
+  curated context the digest reasons over: filtered inventory, native
+  triggers/schedules/action groups, event-log timeline, SQL Logger
+  rollups, fleet health. One call; do not rebuild it tool by tool.
+- WHAT HAVE I ALREADY SUGGESTED — get_observations, with the user's
+  response to each (accepted / declined / snoozed / pending /
+  rejected-as-unsafe-target). Check this before raising something as
+  new; a declined suggestion should not come back.
+- WHAT RULES DOES THE AGENT OWN — get_rules. These are HI's own rules,
+  entirely separate from Indigo's native triggers and schedules. A
+  device can be driven by both; seeing no rule here does not mean
+  nothing automates it.
+- CHANGING RULES — propose_rule validates against the schema and the
+  safety allowlist WITHOUT writing. Always call it first and show the
+  user the preview; only call add_rule once they confirm. update_rule
+  enables, disables, or deletes an existing rule.
+
+Native Indigo automations that appear in the snapshot are read from
+the Indigo database file. A schedule's firing rule is in its
+`schedule` block; `next_execution` alone cannot distinguish an
+absolute 06:00 schedule from one tracking sunrise.
+"""
+
+
 DAYS_OF_WEEK = {
     "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
     "friday": 4, "saturday": 5, "sunday": 6,
@@ -285,6 +320,7 @@ class Plugin(indigo.PluginBase):
             logger=self.logger,
             server_name="home-intelligence",
             server_version=self.pluginVersion,
+            instructions=SERVER_INSTRUCTIONS,
         )
         mcp_tools.register_all(
             self.mcp,
