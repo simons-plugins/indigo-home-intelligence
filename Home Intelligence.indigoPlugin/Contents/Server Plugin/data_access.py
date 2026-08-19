@@ -14,7 +14,7 @@ persistence, and email delivery stay in their own modules.
 """
 
 from datetime import datetime
-from typing import List, Optional
+from typing import List, Optional, Set
 
 import indigo
 
@@ -526,14 +526,35 @@ class HouseContextAccess:
         with an action step targeting ``device_id``.
 
         Returns ``[{automation_type, id, name, roles}, ...]`` where
-        ``roles`` uses lite's vocabulary (``acts_on`` / ``condition``
-        / ``watches``). Only automations that ACT ON the device are
-        returned (``acts_on`` always present); the other roles ride
-        along as context. Raises the reader's friendly ``ValueError``
-        on DB failure — callers (mcp_tools) degrade to omitting the
-        informational block, never blocking the write path."""
+        ``roles`` uses lite's vocabulary (``acts_on`` /
+        ``acts_on_via_props`` / ``condition`` / ``watches``). Only
+        automations that ACT ON the device are returned (one of the
+        two acts_on roles always present); the others ride along as
+        context.
+
+        ``acts_on_via_props`` covers a plugin action step naming the
+        device only inside its own parameters — the majority of the
+        plugin action surface, and invisible to Indigo's own
+        dependency check. Entries carrying it also carry
+        ``matched_props`` naming the parameters that matched, because
+        it is an INFERRED reference, not a declared one.
+
+        Raises the reader's friendly ``ValueError`` on DB failure, and
+        RuntimeError when the live-device lookup fails — callers
+        (mcp_tools) degrade to ``_LOOKUP_UNAVAILABLE``, never blocking
+        the write path. Failing loudly there is deliberate: this gate
+        exists so a rule-write is warned about conflicting native
+        automations, and a partial list would read as a complete
+        one."""
         reader = self._indidb()
         data = reader.automations()
+        presence = self._entity_presence("devices", device_id)
+        if presence == "unavailable":
+            raise RuntimeError(
+                f"live device lookup failed for {device_id}; "
+                "plugin action parameters were not searched"
+            )
+        match_props = presence == "present"
         out: List[dict] = []
         for kind in ("schedule", "trigger", "action_group"):
             for record in data[kind].values():
@@ -544,6 +565,14 @@ class HouseContextAccess:
                         for step in record.get("steps") or ()
                     ):
                         roles.append("acts_on")
+                    matched_props: Set[str] = set()
+                    if match_props:
+                        for step in record.get("steps") or ():
+                            matched_props.update(
+                                self._step_prop_references(step, device_id)
+                            )
+                    if matched_props:
+                        roles.append("acts_on_via_props")
                     if self._condition_references(
                         record.get("conditions"), device_id
                     ):
@@ -553,15 +582,17 @@ class HouseContextAccess:
                         == device_id
                     ):
                         roles.append("watches")
-                    if "acts_on" in roles:
-                        out.append(
-                            {
-                                "automation_type": kind,
-                                "id": record["id"],
-                                "name": record["name"],
-                                "roles": roles,
-                            }
-                        )
+                    if not ({"acts_on", "acts_on_via_props"} & set(roles)):
+                        continue
+                    entry = {
+                        "automation_type": kind,
+                        "id": record["id"],
+                        "name": record["name"],
+                        "roles": roles,
+                    }
+                    if matched_props:
+                        entry["matched_props"] = sorted(matched_props)
+                    out.append(entry)
                 except (MemoryError, KeyboardInterrupt, SystemExit):
                     raise
                 except Exception as exc:
@@ -571,6 +602,70 @@ class HouseContextAccess:
                     )
                     continue
         return out
+
+    @staticmethod
+    def _entity_presence(collection_attr: str, entity_id) -> str:
+        """Whether ``entity_id`` names a live object: present /
+        absent / unavailable.
+
+        ``IndiDbReader.resolve_name`` collapses "no such object" and
+        "the lookup itself failed" into the same ``None`` — right for
+        a display label, wrong for gating a detection pass. Props
+        matching is INFERRED from raw values, so it only runs when the
+        id is known to name a live device: an id that names nothing
+        could collide with an ordinary numeric parameter (a level, a
+        delay). Kept in step with lite's ``_entity_presence``."""
+        collection = getattr(indigo, collection_attr, None)
+        if collection is None:
+            return "unavailable"
+        try:
+            collection[entity_id]
+        except (KeyError, IndexError, ValueError, TypeError):
+            return "absent"
+        except Exception:
+            return "unavailable"
+        return "present"
+
+    @staticmethod
+    def _prop_value_matches(value, entity_id) -> bool:
+        """True if one decoded prop value names ``entity_id``.
+
+        Props are plugin-defined, so an id arrives as an integer, a
+        bare string, or one member of a comma-separated list. Booleans
+        are excluded even though ``isinstance(True, int)`` is True,
+        and floats are never ids — a ``real`` prop is a level or a
+        setpoint. Kept in step with lite's copy."""
+        if isinstance(value, bool):
+            return False
+        if isinstance(value, int):
+            return value == entity_id
+        if isinstance(value, str):
+            target = str(entity_id)
+            return any(part.strip() == target for part in value.split(","))
+        return False
+
+    @classmethod
+    def _iter_prop_matches(cls, value, entity_id, path: str = ""):
+        """Yield the prop paths under ``value`` naming ``entity_id``,
+        dotted for nested dicts and ``[i]`` for vector members."""
+        if isinstance(value, dict):
+            for key, child in value.items():
+                child_path = f"{path}.{key}" if path else str(key)
+                yield from cls._iter_prop_matches(
+                    child, entity_id, child_path
+                )
+        elif isinstance(value, list):
+            for index, child in enumerate(value):
+                yield from cls._iter_prop_matches(
+                    child, entity_id, f"{path}[{index}]"
+                )
+        elif path and cls._prop_value_matches(value, entity_id):
+            yield path
+
+    @classmethod
+    def _step_prop_references(cls, step, entity_id) -> List[str]:
+        """Prop paths in a step naming ``entity_id``."""
+        return list(cls._iter_prop_matches(step.get("props"), entity_id))
 
     @classmethod
     def _condition_references(cls, node, device_id) -> bool:
