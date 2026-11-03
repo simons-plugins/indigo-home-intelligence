@@ -119,7 +119,7 @@ First install requires double-click via Indigo UI. Subsequent updates:
 
 ```bash
 cp -r "Home Intelligence.indigoPlugin" \
-  "/Volumes/Macintosh HD-1/Library/Application Support/Perceptive Automation/Indigo 2025.1/Plugins/"
+  "/Volumes/Macintosh HD-1/Library/Application Support/Perceptive Automation/Indigo 2026.1/Plugins/"
 ```
 
 Then restart the plugin via MCP (`mcp__indigo__restart_plugin`) or the Indigo UI.
